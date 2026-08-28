@@ -116,9 +116,8 @@ class UnitMockTests(unittest.TestCase):
         self.assertIn("conv_12345", cmd)
         self.assertIn("--effort", cmd)
         self.assertIn("high", cmd)
-        self.assertIn("--mode", cmd)
-        self.assertIn("accept-edits", cmd)
         self.assertIn("--dangerously-skip-permissions", cmd)
+        self.assertNotIn("--sandbox", cmd)
 
         # Sandbox mode flags
         record.execution_mode = "sandbox"

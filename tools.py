@@ -334,7 +334,7 @@ class AgyManager:
         if record.effort:
             command.extend(["--effort", record.effort])
         if record.execution_mode == "accept_edits":
-            command.extend(["--mode", "accept-edits", "--dangerously-skip-permissions"])
+            command.append("--dangerously-skip-permissions")
         else:
             command.extend(["--sandbox", "--dangerously-skip-permissions"])
         return command

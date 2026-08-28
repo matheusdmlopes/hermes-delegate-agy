@@ -77,8 +77,8 @@ When delegating, Hermes selects a `task_type` which routes to an appropriate mod
 
 ## ⚙️ Execution Modes
 
-- **`sandbox` (Default)**: Runs `agy` with `--sandbox --dangerously-skip-permissions`. Enforces terminal restrictions while avoiding interactive prompt deadlocks in headless subshells.
-- **`accept_edits`**: Runs `agy` with `--mode accept-edits --dangerously-skip-permissions`. Selected when the user explicitly requests file edits in the target workspace.
+- **`sandbox` (Default)**: Runs `agy` with `--sandbox --dangerously-skip-permissions`. Constrains terminal execution for read-only / diagnostic tasks while avoiding interactive prompt deadlocks.
+- **`accept_edits`**: Runs `agy` in full YOLO mode (`--dangerously-skip-permissions` without sandbox). Allows full file creation, editing, patching, and unrestricted terminal commands.
 
 ---
 
