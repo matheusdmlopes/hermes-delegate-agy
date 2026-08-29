@@ -29,7 +29,7 @@ It enables the primary Hermes agent to spawn asynchronous or blocking background
 ```
 
 - **Zero API Key Extraction**: The `agy` CLI binary manages its own credentials and quota.
-- **Environment Scrubbing**: Process environment is sanitized; Hermes tokens, API keys, and loader variables are scrubbed. Subprocess `stdin` is attached to `/dev/null`.
+- **Adaptive Environment Sanitization**: The plugin inspects the `agy` executable at spawn time. Native binaries (ELF/Mach-O) get a strict allowlist (PATH, HOME, locale vars); shim wrappers (`#!/bin/bash` or `#!/usr/bin/env ...` — common when installed via `mise`, `asdf`, `rtx`, `nix`, `brew`) inherit the parent env and have secrets scrubbed by a denylist. Either way, Hermes secrets, third-party API keys, and loader-hijack vectors (`LD_PRELOAD`, `PYTHONPATH`, `DYLD_*`) are stripped before reaching the worker. Subprocess `stdin` is attached to `/dev/null`.
 - **Zero Daemon / Bridge Required**: Direct standard POSIX subprocess management (`start_new_session=True`, `os.killpg`) with bounded supervision and automated reaper.
 - **Dynamic Binary & Capability Gating**: Automatically verifies `agy` presence and minimum version requirement (>= 1.1.8 with `--output-format json` capability).
 

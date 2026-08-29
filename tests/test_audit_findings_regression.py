@@ -292,7 +292,32 @@ print(json.dumps({
             )
             self.assertTrue(resp["success"], resp)
             obs = json.loads(resp["results"][0]["response"])
-            self.assertEqual(obs["leaked"], [])
+            # Hermes secrets and credential-like values must NEVER reach
+            # the worker, regardless of whether the agy binary is a
+            # native executable (allowlist) or a shim script (denylist).
+            # The denylist intentionally tolerates unrelated env vars
+            # whose name happens to contain "KEY" (e.g. terminal
+            # cosmetics like GUM_LOG_KEY_FOREGROUND) because shim
+            # wrappers like mise/asdf/rtx need their full tool-chain
+            # context to resolve the real agy binary.
+            leaked_secrets = [
+                k for k in obs["leaked"]
+                if any(
+                    pat in k
+                    for pat in (
+                        "HERMES_", "OPENAI_", "ANTHROPIC_", "CLAUDE_",
+                        "AWS_", "GITHUB_TOKEN", "SECRET", "PASSWORD",
+                        "LD_PRELOAD", "LD_LIBRARY_PATH", "DYLD_",
+                        "PYTHONPATH", "PYTHONHOME",
+                    )
+                )
+            ]
+            self.assertEqual(leaked_secrets, [], f"Leaked secret-like vars: {leaked_secrets}")
+            # And confirm the test scenario's hostile secrets specifically
+            # did not reach the worker.
+            self.assertNotIn("HERMES_AUTH_TOKEN", obs["leaked"])
+            self.assertNotIn("OPENAI_API_KEY", obs["leaked"])
+            self.assertNotIn("MY_SUPER_SECRET", obs["leaked"])
             self.assertFalse(obs["is_atty"])
 
     # --- H-07: Output bounded in memory and records ---

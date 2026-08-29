@@ -113,6 +113,107 @@ ALLOWLIST_ENV_KEYS = {
 _AGY_PROBE_CACHE: dict[str, tuple[bool, str | None, str | None]] = {}
 _AGY_PROBE_LOCK = threading.Lock()
 
+# Pattern used by the "script" env strategy to strip any var that looks
+# like a secret. Order matters: substring match, so place longer/more
+# specific fragments first to avoid accidental shadowing.
+_SECRET_DENY_SUBSTRINGS: tuple[str, ...] = (
+    "HERMES_",
+    "ANTHROPIC_",
+    "OPENAI_",
+    "CLAUDE_",
+    "AWS_",
+    "GITHUB_TOKEN",
+    "SECRET",
+    "TOKEN",
+    "PASSWORD",
+    "LD_PRELOAD",
+    "LD_LIBRARY_PATH",
+    "DYLD_",
+    "PYTHONPATH",
+    "PYTHONHOME",
+)
+
+# Magic byte signatures that identify a native executable on the major
+# platforms we support. We only need a tiny sniff to disambiguate native
+# binaries from interpreter shim scripts.
+_NATIVE_MAGIC: tuple[bytes, ...] = (
+    b"\x7fELF",                  # Linux / BSD ELF
+    b"\xfe\xed\xfa\xce",         # Mach-O 32-bit
+    b"\xfe\xed\xfa\xcf",         # Mach-O 64-bit
+    b"\xfe\xed\xfe\xed",         # Mach-O universal
+    b"MZ",                       # Windows PE (we do not run this on win
+                                 # but it is not a shim script either)
+)
+
+
+def _classify_agy_target(path: str) -> str:
+    """Return 'script' if the agy executable at ``path`` is a shim script
+    (any file whose first bytes form a ``#!`` shebang), 'native' otherwise.
+
+    The "native" branch is the safe default: when in doubt, treat the
+    target as a closed binary and use the strict allowlist env so Hermes
+    secrets never leak to a worker we cannot reason about.
+    """
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(4)
+    except OSError:
+        return "native"
+    if not head:
+        return "native"
+    # Shim scripts: any leading whitespace is tolerated, then a '#!'.
+    stripped = head.lstrip()
+    if stripped.startswith(b"#!"):
+        return "script"
+    if any(head.startswith(magic) for magic in _NATIVE_MAGIC):
+        return "native"
+    # Unknown format. Default to the safer allowlist path.
+    return "native"
+
+
+def _build_env_allowlist() -> dict[str, str]:
+    """Strict allowlist env. Used for native agy binaries that do not
+    need any context from the parent shell."""
+    sanitized: dict[str, str] = {}
+    for k, v in os.environ.items():
+        if k in ALLOWLIST_ENV_KEYS or (k.startswith("LC_") and len(k) < 32):
+            if any(bad in k for bad in _SECRET_DENY_SUBSTRINGS):
+                continue
+            sanitized[k] = v
+    return sanitized
+
+
+def _build_env_denylist() -> dict[str, str]:
+    """Inherit the parent env, then drop anything that looks like a
+    secret. Used for shim wrappers (mise/asdf/rtx/nix/brew) that need
+    loader context to resolve the real agy binary."""
+    sanitized: dict[str, str] = {}
+    for k, v in os.environ.items():
+        if any(bad in k for bad in _SECRET_DENY_SUBSTRINGS):
+            continue
+        sanitized[k] = v
+    return sanitized
+
+
+def _build_env_for_target(target_path: str, kind: str) -> dict[str, str]:
+    """Select the env strategy for a given agy target and kind.
+
+    This is split out from ``_execute_once`` so it can be tested in
+    isolation, without spawning a real subprocess.
+    """
+    if kind == "script":
+        return _build_env_denylist()
+    return _build_env_allowlist()
+
+
+def _build_env_for_agy(agy_path: str) -> dict[str, str]:
+    """Public dispatch used by ``_execute_once``: classify the agy
+    binary, then build the matching env. The kind is computed at spawn
+    time so a user who replaces the shim with a real binary does not
+    need to restart Hermes to get the new strategy."""
+    kind = _classify_agy_target(agy_path)
+    return _build_env_for_target(agy_path, kind)
+
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -1025,33 +1126,18 @@ class AgyManager:
         return command
 
     @staticmethod
-    def _build_sanitized_env() -> dict[str, str]:
-        """Construct sanitized environment scrubbing Hermes secrets and loader variables."""
-        sanitized: dict[str, str] = {}
-        for k, v in os.environ.items():
-            if k in ALLOWLIST_ENV_KEYS or (k.startswith("LC_") and len(k) < 32):
-                if any(
-                    bad in k
-                    for bad in (
-                        "HERMES_",
-                        "ANTHROPIC_",
-                        "OPENAI_",
-                        "CLAUDE_",
-                        "AWS_",
-                        "GITHUB_TOKEN",
-                        "SECRET",
-                        "TOKEN",
-                        "PASSWORD",
-                        "LD_PRELOAD",
-                        "LD_LIBRARY_PATH",
-                        "DYLD_",
-                        "PYTHONPATH",
-                        "PYTHONHOME",
-                    )
-                ):
-                    continue
-                sanitized[k] = v
-        return sanitized
+    def _build_sanitized_env(agy_path: str | None = None) -> dict[str, str]:
+        """Build the subprocess env, choosing allowlist or denylist based
+        on whether the agy binary is a native executable or a shim script.
+
+        Backwards-compatible: callers that do not know the path (legacy
+        probes, dry-runs) get the strict allowlist, which is the safer
+        fallback. The hot path (``_execute_once``) always passes the
+        real path so the script branch is selected when appropriate.
+        """
+        if not agy_path:
+            return _build_env_allowlist()
+        return _build_env_for_agy(agy_path)
 
     @staticmethod
     def _parse_payload(stdout: str) -> dict[str, Any] | None:
@@ -1495,7 +1581,7 @@ class AgyManager:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=False,
-                env=self._build_sanitized_env(),
+                env=self._build_sanitized_env(self.agy_path),
                 **creation,
             )
         except OSError as exc:
