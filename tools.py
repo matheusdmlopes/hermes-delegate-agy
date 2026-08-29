@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import fcntl as fcntl_module
 import json
 import math
 import os
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import threading
 import time
@@ -27,13 +29,17 @@ except ImportError:  # pragma: no cover - plugin manifest supports POSIX hosts o
 
 try:
     from plugins.plugin_storage import plugin_data_dir
-except ImportError:
+except ModuleNotFoundError as exc:
+    if exc.name not in {"plugins", "plugins.plugin_storage"}:
+        raise
+
     # Fallback for when plugin is loaded outside Hermes core (e.g., during testing)
     def plugin_data_dir(plugin_name: str) -> Path:
         """Fallback plugin data directory when Hermes core is not available."""
         hermes_home = os.environ.get("HERMES_HOME")
         base = Path(hermes_home) if hermes_home else Path.home() / ".hermes"
         return base / "plugin-data" / plugin_name
+
 
 MODEL_BY_TASK_TYPE = {
     "simple": "gemini-3.7-flash-low",
@@ -45,6 +51,17 @@ MODEL_BY_TASK_TYPE = {
     "cheap_second_opinion": "gpt-oss-120b-medium",
 }
 
+ALL_KNOWN_STATUSES = {
+    "queued",
+    "running",
+    "continuing",
+    "succeeded",
+    "failed",
+    "timed_out",
+    "cancelled",
+    "interrupted",
+}
+
 TERMINAL_STATUSES = {
     "succeeded",
     "failed",
@@ -52,13 +69,49 @@ TERMINAL_STATUSES = {
     "cancelled",
     "interrupted",
 }
+
 _MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
 _WORKER_ID_RE = re.compile(r"^agy_[A-Za-z0-9_-]{1,128}$")
 _RUNTIME_ID_RE = re.compile(r"\A[0-9a-f]{32}\Z")
+_VERSION_RE = re.compile(r"(\d+)\.(\d+)\.(\d+)")
+MINIMUM_AGY_VERSION = (1, 1, 8)
+
 PROCESS_GROUP_TERM_GRACE_SECONDS = 5.0
 PROCESS_REAP_TIMEOUT_SECONDS = 1.0
 PIPE_DRAIN_TIMEOUT_SECONDS = 1.0
 SHUTDOWN_WAIT_SECONDS = 10.0
+MAX_SAMPLE_MEMORY_BYTES = 256 * 1024  # 256KB buffer in memory for JSON payload extraction
+
+LEASE_LOCKED = "LOCKED"
+LEASE_UNLOCKED = "UNLOCKED"
+LEASE_UNKNOWN = "UNKNOWN"
+
+ALLOWLIST_ENV_KEYS = {
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "TMPDIR",
+    "TMP",
+    "TEMP",
+    "SHELL",
+    "LANG",
+    "LANGUAGE",
+    "LC_ALL",
+    "LC_CTYPE",
+    "LC_MESSAGES",
+    "LC_COLLATE",
+    "TERM",
+    "COLORTERM",
+    "SSH_AUTH_SOCK",
+    "XDG_RUNTIME_DIR",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_CACHE_HOME",
+}
+
+_AGY_PROBE_CACHE: dict[str, tuple[bool, str | None, str | None]] = {}
+_AGY_PROBE_LOCK = threading.Lock()
 
 
 def _now() -> str:
@@ -66,7 +119,91 @@ def _now() -> str:
 
 
 def _json_text(payload: dict[str, Any]) -> str:
-    return json.dumps(payload, ensure_ascii=False, default=str)
+    return json.dumps(payload, ensure_ascii=False, allow_nan=False, default=str)
+
+
+def _check_agy_executable(path_or_name: str | None) -> tuple[bool, str | None, str | None]:
+    """Verify presence, absolute canonical path, and capability of agy binary."""
+    target = path_or_name or "agy"
+    which_path = shutil.which(target)
+    if which_path is None:
+        if os.path.isabs(target) and os.path.isfile(target) and os.access(target, os.X_OK):
+            which_path = target
+        else:
+            return False, None, f"agy executable not found: {target}"
+
+    canonical_path = str(Path(which_path).expanduser().resolve())
+    with _AGY_PROBE_LOCK:
+        if canonical_path in _AGY_PROBE_CACHE:
+            return _AGY_PROBE_CACHE[canonical_path]
+
+    if not os.path.isfile(canonical_path) or not os.access(canonical_path, os.X_OK):
+        res = (False, canonical_path, f"Resolved agy path is not an executable file: {canonical_path}")
+        with _AGY_PROBE_LOCK:
+            _AGY_PROBE_CACHE[canonical_path] = res
+        return res
+
+    try:
+        proc = subprocess.run(
+            [canonical_path, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+            check=False,
+        )
+        combined_output = f"{proc.stdout} {proc.stderr}"
+        match = _VERSION_RE.search(combined_output)
+        if match is not None:
+            ver = (int(match.group(1)), int(match.group(2)), int(match.group(3)))
+            if ver < MINIMUM_AGY_VERSION:
+                res = (
+                    False,
+                    canonical_path,
+                    f"agy version {ver[0]}.{ver[1]}.{ver[2]} is below required minimum 1.1.8",
+                )
+                with _AGY_PROBE_LOCK:
+                    _AGY_PROBE_CACHE[canonical_path] = res
+                return res
+
+        if proc.returncode == 0 or match is not None:
+            res = (True, canonical_path, None)
+            with _AGY_PROBE_LOCK:
+                _AGY_PROBE_CACHE[canonical_path] = res
+            return res
+
+        res = (True, canonical_path, None)
+        with _AGY_PROBE_LOCK:
+            _AGY_PROBE_CACHE[canonical_path] = res
+        return res
+    except Exception as exc:
+        res = (True, canonical_path, None)
+        with _AGY_PROBE_LOCK:
+            _AGY_PROBE_CACHE[canonical_path] = res
+        return res
+
+
+def _fsync_dir(dir_path: Path) -> None:
+    """Safely fsync directory descriptor on POSIX."""
+    if os.name != "posix":
+        return
+    try:
+        dfd = os.open(dir_path, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+    except OSError:
+        pass
+
+
+def _truncate_utf8(text: str, max_bytes: int) -> tuple[str, bool]:
+    """Safely truncate text to max_bytes without splitting multi-byte UTF-8 code points."""
+    encoded = text.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return text, False
+    truncated_bytes = encoded[:max_bytes]
+    safe_text = truncated_bytes.decode("utf-8", errors="ignore")
+    return safe_text, True
 
 
 @dataclass
@@ -92,6 +229,7 @@ class RunRecord:
     conversation_id: str | None = None
     parent_worker_id: str | None = None
     response: str = ""
+    response_truncated: bool = False
     usage: dict[str, Any] = field(default_factory=dict)
     duration_seconds: float | None = None
     num_turns: int | None = None
@@ -121,6 +259,12 @@ class AgyManager:
         settings = settings or {}
         self.max_concurrent = self._bounded_int(
             settings.get("max_concurrent", 3), default=3, minimum=1, maximum=10
+        )
+        self.max_pending_workers = self._bounded_int(
+            settings.get("max_pending_workers", 20), default=20, minimum=1, maximum=100
+        )
+        self.max_pending_per_owner = self._bounded_int(
+            settings.get("max_pending_per_owner", 10), default=10, minimum=1, maximum=50
         )
         self.default_timeout = self._bounded_int(
             settings.get("default_timeout_seconds", 600),
@@ -159,15 +303,26 @@ class AgyManager:
             maximum=1024 * 1024,
         )
         self.allow_accept_edits = self._setting_bool(
-            settings.get("allow_accept_edits", True), default=True
+            settings.get("allow_accept_edits", False), default=False
         )
-        self.agy_path = agy_path or shutil.which("agy") or "agy"
-        self.data_dir = plugin_data_dir("delegate-agy")
-        self.runs_dir = self.data_dir / "runs"
-        self.runtime_dir = self.data_dir / "runtime"
-        for directory in (self.data_dir, self.runs_dir, self.runtime_dir):
-            directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-            os.chmod(directory, 0o700)
+        self.max_steer_queue_size = self._bounded_int(
+            settings.get("max_steer_queue_size", 10), default=10, minimum=1, maximum=50
+        )
+        self.max_steer_message_chars = self._bounded_int(
+            settings.get("max_steer_message_chars", 24000), default=24000, minimum=100, maximum=100000
+        )
+
+        is_valid, canonical_agy, err = _check_agy_executable(agy_path)
+        if is_valid and canonical_agy is not None:
+            self.agy_path = canonical_agy
+        else:
+            self.agy_path = str(Path(agy_path).expanduser().resolve()) if agy_path else "agy"
+
+        raw_data_dir = plugin_data_dir("delegate-agy")
+        self.data_dir = self._check_confined_dir(raw_data_dir)
+        self.runs_dir = self._check_confined_dir(self.data_dir / "runs")
+        self.runtime_dir = self._check_confined_dir(self.data_dir / "runtime")
+
         self.runtime_id = uuid.uuid4().hex
         self.supervisor_pid = os.getpid()
         self.supervisor_started_at = _now()
@@ -193,6 +348,8 @@ class AgyManager:
                 max_workers=self.max_concurrent,
                 thread_name_prefix="delegate-agy",
             )
+            self._gc_stale_temporary_files()
+            self._gc_stale_runtime_locks()
             self._load_existing_records()
             self._enforce_retention()
         except BaseException:
@@ -204,29 +361,59 @@ class AgyManager:
             self._release_runtime_lease()
             raise
 
+    @staticmethod
+    def _check_confined_dir(dir_path: Path) -> Path:
+        """Ensure the directory exists, is not a symlink at any level, and has mode 0700."""
+        if dir_path.is_symlink():
+            raise ValueError(f"Storage directory must not be a symlink: {dir_path}")
+        dir_path.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if dir_path.is_symlink():
+            raise ValueError(f"Storage directory must not be a symlink: {dir_path}")
+        st = os.lstat(str(dir_path))
+        if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+            raise ValueError(f"Storage path is not a regular directory: {dir_path}")
+        try:
+            os.chmod(dir_path, 0o700)
+        except OSError:
+            pass
+        return dir_path
+
     def _acquire_runtime_lease(self) -> None:
         if fcntl is None:
             raise RuntimeError("delegate-agy runtime leases require fcntl")
         path = self._runtime_lease_path(self.runtime_id)
-        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+        open_flags = os.O_RDWR | os.O_CREAT
+        if hasattr(os, "O_NOFOLLOW"):
+            open_flags |= os.O_NOFOLLOW
+        fd = os.open(path, open_flags, 0o600)
+        local_fd = fd
         try:
-            os.fchmod(fd, 0o600)
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            os.fchmod(local_fd, 0o600)
+            fcntl.flock(local_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             metadata = json.dumps(
                 {
                     "runtime_id": self.runtime_id,
                     "supervisor_pid": self.supervisor_pid,
                     "supervisor_started_at": self.supervisor_started_at,
-                }
+                },
+                allow_nan=False,
             ).encode("utf-8")
-            os.ftruncate(fd, 0)
-            os.write(fd, metadata)
-            os.fsync(fd)
-        except BaseException:
-            os.close(fd)
-            raise
-        with self._lease_lock:
-            self._runtime_lease_fd = fd
+            os.ftruncate(local_fd, 0)
+            os.write(local_fd, metadata)
+            os.fsync(local_fd)
+            with self._lease_lock:
+                self._runtime_lease_fd = local_fd
+                local_fd = None
+        finally:
+            if local_fd is not None:
+                try:
+                    fcntl.flock(local_fd, fcntl.LOCK_UN)
+                except OSError:
+                    pass
+                try:
+                    os.close(local_fd)
+                except OSError:
+                    pass
 
     def _release_runtime_lease(self) -> None:
         with self._lease_lock:
@@ -245,33 +432,60 @@ class AgyManager:
                 os.close(fd)
             except OSError:
                 pass
+            try:
+                path = self._runtime_lease_path(self.runtime_id)
+                if not path.is_symlink():
+                    path.unlink(missing_ok=True)
+                    _fsync_dir(self.runtime_dir)
+            except (OSError, ValueError):
+                pass
 
-    def _runtime_lease_is_locked(self, runtime_id: str) -> bool:
+    def _runtime_lease_status(self, runtime_id: str) -> str:
+        """Tri-state probe for runtime lease: LOCKED, UNLOCKED, or UNKNOWN."""
         if fcntl is None:
-            return False
+            return LEASE_UNKNOWN
         try:
             path = self._runtime_lease_path(runtime_id)
         except ValueError:
-            return False
+            return LEASE_UNKNOWN
+        if path.is_symlink():
+            return LEASE_UNKNOWN
+
+        open_flags = os.O_RDWR
+        if hasattr(os, "O_NOFOLLOW"):
+            open_flags |= os.O_NOFOLLOW
         try:
-            fd = os.open(path, os.O_RDWR)
-        except (FileNotFoundError, OSError):
-            return False
+            fd = os.open(path, open_flags)
+        except FileNotFoundError:
+            try:
+                if not path.exists() and not path.is_symlink():
+                    return LEASE_UNLOCKED
+            except OSError:
+                pass
+            return LEASE_UNKNOWN
+        except (PermissionError, OSError):
+            return LEASE_UNKNOWN
+
         try:
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except (BlockingIOError, OSError):
-                return True
+            except (BlockingIOError, OSError) as exc:
+                if isinstance(exc, BlockingIOError) or getattr(exc, "errno", None) in {11, 35}:
+                    return LEASE_LOCKED
+                return LEASE_UNKNOWN
             try:
                 fcntl.flock(fd, fcntl.LOCK_UN)
             except OSError:
                 pass
-            return False
+            return LEASE_UNLOCKED
         finally:
             try:
                 os.close(fd)
             except OSError:
                 pass
+
+    def _runtime_lease_is_locked(self, runtime_id: str) -> bool:
+        return self._runtime_lease_status(runtime_id) == LEASE_LOCKED
 
     def _runtime_lease_path(self, runtime_id: str) -> Path:
         if not isinstance(runtime_id, str) or not _RUNTIME_ID_RE.fullmatch(runtime_id):
@@ -283,6 +497,8 @@ class AgyManager:
 
     @staticmethod
     def _bounded_int(value: Any, *, default: int, minimum: int, maximum: int) -> int:
+        if isinstance(value, bool):
+            return default
         try:
             parsed = int(value)
         except (TypeError, ValueError):
@@ -301,19 +517,71 @@ class AgyManager:
                 return False
         return default
 
+    def _gc_stale_runtime_locks(self) -> None:
+        """Garbage-collect unlocked runtime leases left by cleanly or uncleanly exited runtimes."""
+        if fcntl is None or not self.runtime_dir.exists():
+            return
+        try:
+            candidates = list(self.runtime_dir.glob("*.lock"))
+        except OSError:
+            return
+        for lock_path in candidates:
+            if lock_path.is_symlink() or lock_path.name == f"{self.runtime_id}.lock":
+                continue
+            open_flags = os.O_RDWR
+            if hasattr(os, "O_NOFOLLOW"):
+                open_flags |= os.O_NOFOLLOW
+            try:
+                fd = os.open(lock_path, open_flags)
+            except OSError:
+                continue
+            try:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except (BlockingIOError, OSError):
+                    continue
+                try:
+                    lock_path.unlink(missing_ok=True)
+                    _fsync_dir(self.runtime_dir)
+                except OSError:
+                    pass
+            finally:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+
+    def _gc_stale_temporary_files(self) -> None:
+        """Clean up orphaned .tmp files older than 300 seconds."""
+        now = time.time()
+        for directory in (self.runs_dir, self.runtime_dir):
+            if not directory.exists():
+                continue
+            try:
+                for tmp_path in directory.glob("*.tmp"):
+                    if tmp_path.is_symlink():
+                        continue
+                    try:
+                        st = os.lstat(str(tmp_path))
+                        if now - st.st_mtime > 300:
+                            tmp_path.unlink(missing_ok=True)
+                            _fsync_dir(directory)
+                    except OSError:
+                        pass
+            except OSError:
+                pass
+
     def _load_existing_records(self) -> None:
         paths = sorted(self.runs_dir.glob("agy_*.json"), key=self._path_mtime)
         for path in paths:
             record = self._validated_record_from_path(path)
             if record is None:
                 continue
-            if (
-                record.status not in TERMINAL_STATUSES
-                and record.runtime_id
-                and self._runtime_lease_is_locked(record.runtime_id)
-            ):
-                continue
             if record.status not in TERMINAL_STATUSES:
+                if record.runtime_id:
+                    lease_status = self._runtime_lease_status(record.runtime_id)
+                    if lease_status in {LEASE_LOCKED, LEASE_UNKNOWN}:
+                        continue
                 record.status = "interrupted"
                 record.error = "Hermes/plugin runtime ended before this worker completed."
                 record.finished_at = _now()
@@ -354,21 +622,42 @@ class AgyManager:
         if record is None or record.worker_id != worker_id:
             return None
         if record.status not in TERMINAL_STATUSES:
-            if record.runtime_id and self._runtime_lease_is_locked(record.runtime_id):
-                raise ValueError(
-                    f"Worker is externally supervised by runtime {record.runtime_id}: {worker_id}"
-                )
+            if record.runtime_id:
+                lease_status = self._runtime_lease_status(record.runtime_id)
+                if lease_status == LEASE_LOCKED:
+                    raise ValueError(
+                        f"Worker is externally supervised by runtime {record.runtime_id}: {worker_id}"
+                    )
+                if lease_status == LEASE_UNKNOWN:
+                    raise ValueError(
+                        f"Worker runtime lease status could not be verified: {worker_id}"
+                    )
             record.status = "interrupted"
             record.error = "Hermes/plugin runtime ended before this worker completed."
             record.finished_at = _now()
             self._write_record(record)
         return record
 
+    @staticmethod
+    def _sanitize_usage(usage: Any) -> dict[str, Any]:
+        if not isinstance(usage, dict):
+            return {}
+        sanitized: dict[str, Any] = {}
+        for k, v in usage.items():
+            if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(float(v)):
+                sanitized[str(k)] = v
+        return sanitized
+
     def _validated_record_from_path(self, path: Path) -> RunRecord | None:
-        """Load one confined, internally consistent record without rewriting it."""
+        """Load one confined, schema-validated record without rewriting it."""
         try:
             runs_root = self.runs_dir.resolve()
             if path.is_symlink():
+                return None
+            st = os.lstat(str(path))
+            if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+                return None
+            if st.st_size > 2 * 1024 * 1024:
                 return None
             resolved = path.resolve()
             if not resolved.is_relative_to(runs_root) or resolved.parent != runs_root:
@@ -376,32 +665,102 @@ class AgyManager:
             worker_id_from_filename = resolved.stem
             if not _WORKER_ID_RE.fullmatch(worker_id_from_filename):
                 return None
-            raw = json.loads(resolved.read_text(encoding="utf-8"))
+
+            def _reject_constants(val: str):
+                raise ValueError(f"Invalid non-finite constant: {val}")
+
+            raw_text = resolved.read_text(encoding="utf-8", errors="replace")
+            decoder = json.JSONDecoder(parse_constant=_reject_constants)
+            raw, _ = decoder.raw_decode(raw_text)
             if not isinstance(raw, dict):
                 return None
-            known_fields = {item.name for item in fields(RunRecord)}
-            record = RunRecord(
-                **{key: value for key, value in raw.items() if key in known_fields}
-            )
-        except (OSError, ValueError, TypeError):
-            return None
 
-        if not isinstance(record.worker_id, str):
-            return None
-        if record.worker_id != worker_id_from_filename:
-            return None
-        if not _WORKER_ID_RE.fullmatch(record.worker_id):
-            return None
-        owner_id = str(record.owner_id).strip()
-        if not owner_id:
-            return None
-        record.owner_id = owner_id
-        if record.runtime_id is not None:
-            if not isinstance(record.runtime_id, str):
+            worker_id = raw.get("worker_id")
+            if not isinstance(worker_id, str) or worker_id != worker_id_from_filename or not _WORKER_ID_RE.fullmatch(worker_id):
                 return None
-            if not _RUNTIME_ID_RE.fullmatch(record.runtime_id):
+            owner_id = raw.get("owner_id")
+            if not isinstance(owner_id, str) or not owner_id.strip() or owner_id.strip().lower() == "none":
                 return None
-        return record
+            owner_id = owner_id.strip()
+            status = raw.get("status")
+            if not isinstance(status, str) or status not in ALL_KNOWN_STATUSES:
+                return None
+            goal = raw.get("goal")
+            if not isinstance(goal, str):
+                return None
+            context = raw.get("context", "")
+            if not isinstance(context, str):
+                return None
+            prompt = raw.get("prompt", "")
+            if not isinstance(prompt, str):
+                return None
+            task_type = raw.get("task_type", "investigation")
+            if not isinstance(task_type, str) or task_type not in MODEL_BY_TASK_TYPE:
+                return None
+            model = raw.get("model", "")
+            if not isinstance(model, str) or not _MODEL_RE.fullmatch(model):
+                return None
+            execution_mode = raw.get("execution_mode", "sandbox")
+            if not isinstance(execution_mode, str) or execution_mode not in {"sandbox", "accept_edits"}:
+                return None
+            effort = raw.get("effort")
+            if effort is not None and (not isinstance(effort, str) or effort not in {"low", "medium", "high"}):
+                return None
+            workdir = raw.get("workdir", "")
+            if not isinstance(workdir, str):
+                return None
+            timeout_seconds = raw.get("timeout_seconds")
+            if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float)) or int(timeout_seconds) < 1:
+                return None
+            timeout_seconds = int(timeout_seconds)
+
+            runtime_id = raw.get("runtime_id")
+            if runtime_id is not None and (not isinstance(runtime_id, str) or not _RUNTIME_ID_RE.fullmatch(runtime_id)):
+                return None
+
+            raw_response = str(raw.get("response", ""))
+            response_trunc = bool(raw.get("response_truncated", False)) or len(raw_response) > self.max_result_chars
+            bounded_response, _ = _truncate_utf8(raw_response, self.max_result_chars)
+
+            record = RunRecord(
+                worker_id=worker_id,
+                owner_id=owner_id,
+                goal=goal,
+                context=context,
+                prompt=prompt,
+                task_type=task_type,
+                model=model,
+                execution_mode=execution_mode,
+                effort=effort,
+                workdir=workdir,
+                timeout_seconds=timeout_seconds,
+                status=status,
+                created_at=str(raw.get("created_at") or _now()),
+                started_at=str(raw["started_at"]) if raw.get("started_at") is not None else None,
+                finished_at=str(raw["finished_at"]) if raw.get("finished_at") is not None else None,
+                pid=int(raw["pid"]) if isinstance(raw.get("pid"), int) and not isinstance(raw.get("pid"), bool) else None,
+                pgid=int(raw["pgid"]) if isinstance(raw.get("pgid"), int) and not isinstance(raw.get("pgid"), bool) else None,
+                returncode=int(raw["returncode"]) if isinstance(raw.get("returncode"), int) and not isinstance(raw.get("returncode"), bool) else None,
+                conversation_id=str(raw["conversation_id"]) if raw.get("conversation_id") is not None else None,
+                parent_worker_id=str(raw["parent_worker_id"]) if raw.get("parent_worker_id") is not None else None,
+                response=bounded_response,
+                response_truncated=response_trunc,
+                usage=self._sanitize_usage(raw.get("usage")),
+                duration_seconds=float(raw["duration_seconds"]) if self._finite_number(raw.get("duration_seconds")) else None,
+                num_turns=int(raw["num_turns"]) if self._finite_number(raw.get("num_turns")) else None,
+                error=str(raw["error"]) if raw.get("error") is not None else None,
+                stdout_path=str(raw["stdout_path"]) if raw.get("stdout_path") is not None else None,
+                stderr_path=str(raw["stderr_path"]) if raw.get("stderr_path") is not None else None,
+                steer_queue=[str(s) for s in raw["steer_queue"] if isinstance(s, str)] if isinstance(raw.get("steer_queue"), list) else [],
+                cancel_requested=bool(raw.get("cancel_requested", False)),
+                runtime_id=runtime_id,
+                supervisor_pid=int(raw["supervisor_pid"]) if isinstance(raw.get("supervisor_pid"), int) and not isinstance(raw.get("supervisor_pid"), bool) else None,
+                supervisor_started_at=str(raw["supervisor_started_at"]) if raw.get("supervisor_started_at") is not None else None,
+                attempt_index=int(raw["attempt_index"]) if isinstance(raw.get("attempt_index"), int) and not isinstance(raw.get("attempt_index"), bool) and int(raw.get("attempt_index", 1)) >= 1 else 1,
+            )
+            return record
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            return None
 
     def _record_path(self, worker_id: str) -> Path:
         if not isinstance(worker_id, str) or not _WORKER_ID_RE.fullmatch(worker_id):
@@ -413,27 +772,30 @@ class AgyManager:
 
     def _write_record(self, record: RunRecord) -> None:
         path = self._record_path(record.worker_id)
-        temporary = path.with_name(
-            f"{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
-        )
+        temporary = path.with_name(f"{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+        open_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            open_flags |= os.O_NOFOLLOW
         try:
-            fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            fd = os.open(temporary, open_flags, 0o600)
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
                 json.dump(
                     asdict(record),
                     handle,
                     ensure_ascii=False,
                     indent=2,
+                    allow_nan=False,
                     default=str,
                 )
                 handle.flush()
                 os.fsync(handle.fileno())
                 os.fchmod(handle.fileno(), 0o600)
             os.replace(temporary, path)
-            os.chmod(path, 0o600)
+            _fsync_dir(self.runs_dir)
         finally:
             try:
-                temporary.unlink(missing_ok=True)
+                if temporary.exists():
+                    temporary.unlink(missing_ok=True)
             except OSError:
                 pass
 
@@ -460,10 +822,17 @@ class AgyManager:
 
     @staticmethod
     def _owner_id(kwargs: dict[str, Any]) -> str:
-        owner_id = kwargs.get("session_id") or kwargs.get("task_id")
-        if not owner_id:
-            raise ValueError("Hermes did not provide task_id or session_id; refusing unscoped access")
-        return str(owner_id)
+        session_id = kwargs.get("session_id")
+        if session_id is not None:
+            session_id_str = str(session_id).strip()
+            if session_id_str:
+                return session_id_str
+        task_id = kwargs.get("task_id")
+        if task_id is not None:
+            task_id_str = str(task_id).strip()
+            if task_id_str:
+                return task_id_str
+        raise ValueError("Hermes did not provide a valid task_id or session_id; refusing unscoped access")
 
     def _owned_record(self, owner_id: str, worker_id: str) -> RunRecord:
         with self._lock:
@@ -504,9 +873,12 @@ class AgyManager:
 
     def _result(self, record: RunRecord) -> dict[str, Any]:
         response = record.response
-        truncated = len(response) > self.max_result_chars
-        if truncated:
+        truncated = record.response_truncated or len(response) > self.max_result_chars
+        if len(response) > self.max_result_chars:
             response = response[: self.max_result_chars] + "\n[truncated; inspect stdout_path]"
+        elif truncated and not response.endswith("[truncated; inspect stdout_path]"):
+            response = response + "\n[truncated; inspect stdout_path]"
+
         result = self._summary(record)
         result.update(
             {
@@ -525,21 +897,27 @@ class AgyManager:
         return result
 
     @staticmethod
-    def _validate_text(value: Any, field_name: str, *, required: bool = False) -> str:
+    def _validate_text(
+        value: Any,
+        field_name: str,
+        *,
+        required: bool = False,
+        max_len: int = 100000,
+    ) -> str:
         text = "" if value is None else str(value).strip()
         if required and not text:
             raise ValueError(f"{field_name} is required")
-        if len(text) > 100000:
-            raise ValueError(f"{field_name} exceeds 100000 characters")
+        if len(text) > max_len:
+            raise ValueError(f"{field_name} exceeds {max_len} characters")
         return text
 
     def _task_spec(self, raw: dict[str, Any], default_workdir: str | None) -> dict[str, Any]:
-        goal = self._validate_text(raw.get("goal"), "goal", required=True)
-        context = self._validate_text(raw.get("context"), "context")
+        goal = self._validate_text(raw.get("goal"), "goal", required=True, max_len=64000)
+        context = self._validate_text(raw.get("context"), "context", max_len=64000)
         task_type = str(raw.get("task_type") or "investigation")
         if task_type not in MODEL_BY_TASK_TYPE:
             raise ValueError(f"Unknown task_type: {task_type}")
-        explicit_model = self._validate_text(raw.get("model"), "model")
+        explicit_model = self._validate_text(raw.get("model"), "model", max_len=128)
         model = explicit_model or MODEL_BY_TASK_TYPE[task_type]
         if not _MODEL_RE.fullmatch(model):
             raise ValueError(f"Invalid agy model ID: {model}")
@@ -563,6 +941,8 @@ class AgyManager:
             maximum=7200,
         )
         prompt = self._worker_prompt(goal, context, str(workdir_path))
+        if len(prompt.encode("utf-8")) > 64000:
+            raise ValueError("Combined task goal and context exceeds maximum size of 64KB")
         return {
             "goal": goal,
             "context": context,
@@ -595,56 +975,6 @@ class AgyManager:
             "and any remaining blocker. Do not claim success without verification."
         )
         return "\n".join(sections)
-
-    def _new_record(
-        self,
-        owner_id: str,
-        spec: dict[str, Any],
-        *,
-        conversation_id: str | None = None,
-        parent_worker_id: str | None = None,
-    ) -> RunRecord:
-        worker_id = f"agy_{uuid.uuid4().hex[:12]}"
-        record = RunRecord(
-            worker_id=worker_id,
-            owner_id=owner_id,
-            conversation_id=conversation_id,
-            parent_worker_id=parent_worker_id,
-            runtime_id=self.runtime_id,
-            supervisor_pid=self.supervisor_pid,
-            supervisor_started_at=self.supervisor_started_at,
-            **spec,
-        )
-        with self._lock:
-            if self._closed:
-                raise RuntimeError("delegate-agy is shutting down")
-            try:
-                self._write_record(record)
-            except Exception as exc:
-                try:
-                    self._record_path(record.worker_id).unlink(missing_ok=True)
-                except OSError:
-                    pass
-                raise RuntimeError(f"Initial record persistence failed: {exc}") from exc
-            self._records[worker_id] = record
-            try:
-                if self._executor is None:
-                    raise RuntimeError("delegate-agy executor is unavailable")
-                future = self._executor.submit(self._supervise_worker, worker_id)
-            except Exception as exc:
-                record.status = "failed"
-                record.finished_at = _now()
-                record.error = f"Could not submit worker: {exc}"
-                try:
-                    self._write_record(record)
-                except OSError:
-                    pass
-                raise RuntimeError(record.error) from exc
-            self._futures[worker_id] = future
-            future.add_done_callback(
-                lambda completed, target=worker_id: self._future_done(target, completed)
-            )
-        return record
 
     def _future_done(self, worker_id: str, completed: Future[None]) -> None:
         with self._lock:
@@ -689,10 +1019,39 @@ class AgyManager:
         if record.effort:
             command.extend(["--effort", record.effort])
         if record.execution_mode == "accept_edits":
-            command.append("--dangerously-skip-permissions")
+            command.extend(["--mode=accept-edits", "--dangerously-skip-permissions"])
         else:
-            command.extend(["--sandbox", "--dangerously-skip-permissions"])
+            command.extend(["--mode=plan", "--sandbox"])
         return command
+
+    @staticmethod
+    def _build_sanitized_env() -> dict[str, str]:
+        """Construct sanitized environment scrubbing Hermes secrets and loader variables."""
+        sanitized: dict[str, str] = {}
+        for k, v in os.environ.items():
+            if k in ALLOWLIST_ENV_KEYS or (k.startswith("LC_") and len(k) < 32):
+                if any(
+                    bad in k
+                    for bad in (
+                        "HERMES_",
+                        "ANTHROPIC_",
+                        "OPENAI_",
+                        "CLAUDE_",
+                        "AWS_",
+                        "GITHUB_TOKEN",
+                        "SECRET",
+                        "TOKEN",
+                        "PASSWORD",
+                        "LD_PRELOAD",
+                        "LD_LIBRARY_PATH",
+                        "DYLD_",
+                        "PYTHONPATH",
+                        "PYTHONHOME",
+                    )
+                ):
+                    continue
+                sanitized[k] = v
+        return sanitized
 
     @staticmethod
     def _parse_payload(stdout: str) -> dict[str, Any] | None:
@@ -700,12 +1059,27 @@ class AgyManager:
         if not cleaned:
             return None
 
+        forbidden_keys = {
+            "event",
+            "level",
+            "logger",
+            "timestamp",
+            "log",
+            "message_type",
+            "log_level",
+            "caller",
+        }
+
         def is_result_payload(candidate: Any) -> bool:
             if not isinstance(candidate, dict):
                 return False
-            has_response = candidate.get("response") is not None
-            has_conv_id = bool(candidate.get("conversation_id"))
-            has_error = candidate.get("error") is not None
+            # Veto log markers FIRST before evaluating status
+            if any(k in candidate for k in forbidden_keys):
+                return False
+
+            has_response = isinstance(candidate.get("response"), str)
+            has_conv_id = isinstance(candidate.get("conversation_id"), str) and bool(candidate.get("conversation_id"))
+            has_error = candidate.get("error") is not None and isinstance(candidate.get("error"), str)
             status = candidate.get("status")
             status_str = str(status).upper() if isinstance(status, str) else None
 
@@ -713,19 +1087,22 @@ class AgyManager:
                 return has_response or has_conv_id
             if status_str in {"ERROR", "FAILED"}:
                 return has_error
-            if (has_response or has_conv_id) and not any(k in candidate for k in ("event", "level", "logger")):
-                return True
-            if has_error and not any(k in candidate for k in ("event", "level", "logger")):
-                return True
+            if status is None:
+                return has_response or has_error or has_conv_id
             return False
 
+        def _reject_constants(val: str):
+            raise ValueError(f"Invalid non-finite JSON constant: {val}")
+
+        decoder = json.JSONDecoder(parse_constant=_reject_constants)
+
         try:
-            payload = json.loads(cleaned)
-            return payload if is_result_payload(payload) else None
-        except json.JSONDecodeError:
+            payload, _ = decoder.raw_decode(cleaned)
+            if is_result_payload(payload):
+                return payload
+        except (json.JSONDecodeError, ValueError):
             pass
 
-        decoder = json.JSONDecoder()
         candidates: list[dict[str, Any]] = []
         cursor = 0
         while cursor < len(cleaned):
@@ -737,7 +1114,7 @@ class AgyManager:
             start = min(starts)
             try:
                 candidate, end = decoder.raw_decode(cleaned, start)
-            except json.JSONDecodeError:
+            except (json.JSONDecodeError, ValueError):
                 cursor = start + 1
                 continue
             if is_result_payload(candidate):
@@ -765,12 +1142,14 @@ class AgyManager:
         agy_status = ""
         if payload is not None:
             conversation_id = payload.get("conversation_id")
-            if conversation_id:
-                record.conversation_id = str(conversation_id)
-            if "response" in payload and payload.get("response") is not None:
-                record.response = str(payload["response"])
+            if isinstance(conversation_id, str) and conversation_id:
+                record.conversation_id = conversation_id
+            if "response" in payload and isinstance(payload.get("response"), str):
+                resp_text, truncated = _truncate_utf8(payload["response"], self.max_result_chars)
+                record.response = resp_text
+                record.response_truncated = truncated or bool(payload.get("response_truncated", False))
             usage = payload.get("usage")
-            record.usage = usage if isinstance(usage, dict) else {}
+            record.usage = self._sanitize_usage(usage)
             duration = payload.get("duration_seconds")
             record.duration_seconds = (
                 float(duration) if self._finite_number(duration) else None
@@ -788,7 +1167,7 @@ class AgyManager:
             record.error = None
             return True
 
-        structured_error = payload.get("error") if payload is not None else None
+        structured_error = payload.get("error") if payload is not None and isinstance(payload.get("error"), str) else None
         details = (
             str(structured_error).strip()
             if structured_error is not None and str(structured_error).strip()
@@ -836,27 +1215,12 @@ class AgyManager:
 
     @staticmethod
     def _close_process_pipes(process: subprocess.Popen[str]) -> None:
-        for stream in (process.stdout, process.stderr):
+        for stream in (process.stdout, process.stderr, process.stdin):
             if stream is not None:
                 try:
                     stream.close()
                 except OSError:
                     pass
-
-    def _bounded_drain(
-        self, process: subprocess.Popen[str]
-    ) -> tuple[str, str, str | None]:
-        try:
-            stdout, stderr = process.communicate(timeout=PIPE_DRAIN_TIMEOUT_SECONDS)
-            return stdout or "", stderr or "", None
-        except subprocess.TimeoutExpired as exc:
-            stdout = exc.output if isinstance(exc.output, str) else ""
-            stderr = exc.stderr if isinstance(exc.stderr, str) else ""
-            self._close_process_pipes(process)
-            return stdout, stderr, "Timed out while draining terminated agy output pipes."
-        except (OSError, ValueError) as exc:
-            self._close_process_pipes(process)
-            return "", "", f"Could not drain terminated agy output pipes: {exc}"
 
     def _terminate_process(
         self, process: subprocess.Popen[str], pgid: int | None
@@ -867,9 +1231,7 @@ class AgyManager:
             if self._group_exists(pgid):
                 try:
                     os.killpg(pgid, signal.SIGTERM)
-                except ProcessLookupError:
-                    pass
-                except OSError:
+                except (ProcessLookupError, OSError):
                     pass
                 deadline = time.monotonic() + PROCESS_GROUP_TERM_GRACE_SECONDS
                 while time.monotonic() < deadline and self._group_exists(pgid):
@@ -877,9 +1239,7 @@ class AgyManager:
                 if self._group_exists(pgid):
                     try:
                         os.killpg(pgid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
-                    except OSError:
+                    except (ProcessLookupError, OSError):
                         pass
         else:
             try:
@@ -931,7 +1291,11 @@ class AgyManager:
     def _ensure_resource_reaper(self, *worker_ids: str) -> None:
         """Keep process ownership and the runtime lease until all work is quiescent."""
         with self._lock:
-            self._reap_worker_ids.update(worker_ids)
+            # Only track worker IDs that actually have active processes
+            valid_ids = [wid for wid in worker_ids if wid in self._processes]
+            self._reap_worker_ids.update(valid_ids)
+            if not self._reap_worker_ids and not self._closed:
+                return
         with self._lease_lock:
             existing = self._reaper_thread
             if existing is not None and existing.is_alive():
@@ -950,6 +1314,7 @@ class AgyManager:
             while True:
                 with self._lock:
                     closed = self._closed
+                    self._reap_worker_ids.intersection_update(self._processes.keys())
                     if closed:
                         owned_processes = list(self._processes.items())
                     else:
@@ -967,6 +1332,7 @@ class AgyManager:
                     )
 
                 with self._lock:
+                    self._reap_worker_ids.intersection_update(self._processes.keys())
                     processes_remain = bool(self._processes)
                     closed = self._closed
                     pending_cleanup = bool(self._reap_worker_ids)
@@ -999,6 +1365,7 @@ class AgyManager:
             if cleared_current:
                 with self._lock:
                     closed = self._closed
+                    self._reap_worker_ids.intersection_update(self._processes.keys())
                     resources_remain = bool(self._processes) or any(
                         not future.done() for future in self._futures.values()
                     )
@@ -1007,6 +1374,108 @@ class AgyManager:
                 elif closed:
                     self._release_runtime_lease()
 
+    def _drain_and_stream(
+        self,
+        process: subprocess.Popen[str],
+        stdout_dest: Path,
+        stderr_dest: Path,
+        timeout: float,
+    ) -> tuple[str, str, str | None]:
+        """Stream process output directly to disk up to max_raw_output_bytes and sample memory."""
+        stdout_temp = stdout_dest.with_name(f"{stdout_dest.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+        stderr_temp = stderr_dest.with_name(f"{stderr_dest.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+        stdout_sample = bytearray()
+        stderr_sample = bytearray()
+
+        def _reader(stream, temp_path, sample_buf):
+            open_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            if hasattr(os, "O_NOFOLLOW"):
+                open_flags |= os.O_NOFOLLOW
+            written = 0
+            fd = None
+            try:
+                fd = os.open(temp_path, open_flags, 0o600)
+                while True:
+                    try:
+                        chunk = stream.read(16384)
+                    except (ValueError, OSError):
+                        break
+                    if not chunk:
+                        break
+                    if isinstance(chunk, str):
+                        chunk_bytes = chunk.encode("utf-8", errors="replace")
+                    else:
+                        chunk_bytes = bytes(chunk)
+                    if len(sample_buf) < MAX_SAMPLE_MEMORY_BYTES:
+                        avail = MAX_SAMPLE_MEMORY_BYTES - len(sample_buf)
+                        sample_buf.extend(chunk_bytes[:avail])
+                    if written < self.max_raw_output_bytes:
+                        to_write = chunk_bytes[: self.max_raw_output_bytes - written]
+                        os.write(fd, to_write)
+                        written += len(to_write)
+                if fd is not None:
+                    os.fsync(fd)
+                    os.fchmod(fd, 0o600)
+            except OSError:
+                pass
+            finally:
+                if fd is not None:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+
+        threads = []
+        if process.stdout is not None:
+            t_out = threading.Thread(
+                target=_reader,
+                args=(process.stdout, stdout_temp, stdout_sample),
+                daemon=True,
+            )
+            threads.append(t_out)
+            t_out.start()
+        if process.stderr is not None:
+            t_err = threading.Thread(
+                target=_reader,
+                args=(process.stderr, stderr_temp, stderr_sample),
+                daemon=True,
+            )
+            threads.append(t_err)
+            t_err.start()
+
+        drain_error = None
+        try:
+            process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            drain_error = f"agy exceeded the timeout of {timeout}s"
+        except Exception as exc:
+            drain_error = f"Process wait failed: {exc}"
+
+        for t in threads:
+            t.join(timeout=PIPE_DRAIN_TIMEOUT_SECONDS)
+        self._close_process_pipes(process)
+
+        try:
+            if stdout_temp.exists():
+                os.replace(stdout_temp, stdout_dest)
+            if stderr_temp.exists():
+                os.replace(stderr_temp, stderr_dest)
+            _fsync_dir(self.runs_dir)
+        except OSError:
+            pass
+        finally:
+            try:
+                if stdout_temp.exists():
+                    stdout_temp.unlink(missing_ok=True)
+                if stderr_temp.exists():
+                    stderr_temp.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+        stdout_str = stdout_sample.decode("utf-8", errors="replace")
+        stderr_str = stderr_sample.decode("utf-8", errors="replace")
+        return stdout_str, stderr_str, drain_error
+
     def _execute_once(self, record: RunRecord, prompt: str) -> bool:
         command = self._build_command(record, prompt)
         creation: dict[str, Any] = {}
@@ -1014,15 +1483,19 @@ class AgyManager:
             creation["start_new_session"] = True
         process: subprocess.Popen[str]
         pgid: int | None = None
+        attempt = max(1, record.attempt_index)
+        stdout_dest = self.runs_dir / f"{record.worker_id}.turn-{attempt:03d}.stdout"
+        stderr_dest = self.runs_dir / f"{record.worker_id}.turn-{attempt:03d}.stderr"
+
         try:
             process = subprocess.Popen(
                 command,
                 cwd=record.workdir,
+                stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
+                text=False,
+                env=self._build_sanitized_env(),
                 **creation,
             )
         except OSError as exc:
@@ -1034,87 +1507,79 @@ class AgyManager:
                 except OSError:
                     pass
             return False
+
         try:
-            try:
-                if os.name == "posix":
-                    pgid = os.getpgid(process.pid)
-                    if not self._captured_group_is_owned(process, pgid):
-                        raise RuntimeError(
-                            f"Refusing unsafe process group pid={process.pid} pgid={pgid}"
-                        )
-                with self._lock:
-                    self._processes[record.worker_id] = OwnedProcess(process, pgid)
-                    record.pid = process.pid
-                    record.pgid = pgid
+            if os.name == "posix":
+                pgid = process.pid
+                # Bounded verification of PGID
+                for _ in range(5):
                     try:
-                        self._write_record(record)
-                    except OSError as exc:
-                        raise RuntimeError(f"Post-spawn persistence failed: {exc}") from exc
-                    cancel_requested = record.cancel_requested
-            except Exception as exc:
-                self._terminate_process(process, pgid)
-                self._bounded_drain(process)
-                with self._lock:
-                    record.returncode = process.returncode
-                    try:
-                        self._transition(record, "failed", error=str(exc), finished=True)
-                    except OSError:
-                        record.status = "failed"
-                        record.error = str(exc)
-                        record.finished_at = record.finished_at or _now()
-                return False
+                        actual_pgid = os.getpgid(process.pid)
+                        if actual_pgid == process.pid:
+                            pgid = actual_pgid
+                            break
+                    except (ProcessLookupError, OSError):
+                        pass
+                    time.sleep(0.01)
+
+            with self._lock:
+                ownership = OwnedProcess(process, pgid)
+                self._processes[record.worker_id] = ownership
+                record.pid = process.pid
+                record.pgid = pgid
+                record.stdout_path = str(stdout_dest)
+                record.stderr_path = str(stderr_dest)
+                try:
+                    self._write_record(record)
+                except OSError as exc:
+                    raise RuntimeError(f"Post-spawn persistence failed: {exc}") from exc
+                cancel_requested = record.cancel_requested
 
             if cancel_requested:
                 self._terminate_process(process, pgid)
 
-            try:
-                stdout, stderr = process.communicate(timeout=record.timeout_seconds + 30)
-            except subprocess.TimeoutExpired:
-                self._terminate_process(process, pgid)
-                stdout, stderr, drain_error = self._bounded_drain(process)
-                stdout_path, stderr_path = self._save_raw_output(record, stdout, stderr)
-                error = f"agy exceeded the outer timeout of {record.timeout_seconds + 30}s"
-                if drain_error:
-                    error = f"{error}; {drain_error}"
+            timeout = record.timeout_seconds + 30
+            stdout, stderr, drain_error = self._drain_and_stream(
+                process, stdout_dest, stderr_dest, timeout
+            )
+
+            if cancel_requested:
                 with self._lock:
                     record.returncode = process.returncode
-                    record.stdout_path = stdout_path
-                    record.stderr_path = stderr_path
                     try:
-                        self._transition(record, "timed_out", error=error, finished=True)
+                        self._transition(record, "cancelled", error="Cancelled by user or session.", finished=True)
                     except OSError:
-                        record.status = "timed_out"
-                        record.error = error
-                        record.finished_at = record.finished_at or _now()
+                        pass
                 return False
-            except Exception as exc:
+
+            if drain_error:
                 self._terminate_process(process, pgid)
-                stdout, stderr, drain_error = self._bounded_drain(process)
-                stdout_path, stderr_path = self._save_raw_output(record, stdout, stderr)
-                error = f"Process communication failed: {exc}"
-                if drain_error:
-                    error = f"{error}; {drain_error}"
+                status = "timed_out" if "timeout" in drain_error else "failed"
                 with self._lock:
                     record.returncode = process.returncode
-                    record.stdout_path = stdout_path
-                    record.stderr_path = stderr_path
                     try:
-                        self._transition(record, "failed", error=error, finished=True)
+                        self._transition(record, status, error=drain_error, finished=True)
                     except OSError:
-                        record.status = "failed"
-                        record.error = error
+                        record.status = status
+                        record.error = drain_error
                         record.finished_at = record.finished_at or _now()
                 return False
 
             if os.name == "posix" and pgid is not None and self._group_exists(pgid):
                 self._terminate_process(process, pgid)
 
-            stdout_path, stderr_path = self._save_raw_output(record, stdout, stderr)
             payload = self._parse_payload(stdout)
+            if payload is None and stdout_dest.exists():
+                try:
+                    file_size = stdout_dest.stat().st_size
+                    if 0 < file_size <= 4 * 1024 * 1024:
+                        raw_file_text = stdout_dest.read_text(encoding="utf-8", errors="replace")
+                        payload = self._parse_payload(raw_file_text)
+                except OSError:
+                    pass
+
             with self._lock:
                 record.returncode = process.returncode
-                record.stdout_path = stdout_path
-                record.stderr_path = stderr_path
                 successful = self._interpret_payload(
                     record,
                     payload,
@@ -1124,6 +1589,20 @@ class AgyManager:
                 )
                 self._write_record(record)
             return successful
+        except BaseException as exc:
+            self._terminate_process(process, pgid)
+            self._close_process_pipes(process)
+            with self._lock:
+                record.returncode = process.returncode
+                try:
+                    self._transition(record, "failed", error=str(exc), finished=True)
+                except OSError:
+                    record.status = "failed"
+                    record.error = str(exc)
+                    record.finished_at = record.finished_at or _now()
+            if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                raise
+            return False
         finally:
             ownership = OwnedProcess(process, pgid)
             with self._lock:
@@ -1143,40 +1622,6 @@ class AgyManager:
                     f"(pgid={pgid})"
                 )
 
-    def _atomic_output_write(self, path: Path, content: str) -> str | None:
-        temporary = path.with_name(
-            f"{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
-        )
-        try:
-            encoded = content.encode("utf-8")[: self.max_raw_output_bytes]
-            fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            with os.fdopen(fd, "wb") as handle:
-                handle.write(encoded)
-                handle.flush()
-                os.fsync(handle.fileno())
-                os.fchmod(handle.fileno(), 0o600)
-            os.replace(temporary, path)
-            os.chmod(path, 0o600)
-            return str(path)
-        except OSError:
-            return None
-        finally:
-            try:
-                temporary.unlink(missing_ok=True)
-            except OSError:
-                pass
-
-    def _save_raw_output(
-        self, record: RunRecord, stdout: str, stderr: str
-    ) -> tuple[str | None, str | None]:
-        attempt = max(1, record.attempt_index)
-        stdout_path = self.runs_dir / f"{record.worker_id}.turn-{attempt:03d}.stdout"
-        stderr_path = self.runs_dir / f"{record.worker_id}.turn-{attempt:03d}.stderr"
-        return (
-            self._atomic_output_write(stdout_path, stdout),
-            self._atomic_output_write(stderr_path, stderr),
-        )
-
     def _record_retention_error(self, exc: BaseException) -> None:
         with self._lock:
             self._retention_errors.append(str(exc))
@@ -1190,6 +1635,7 @@ class AgyManager:
                 path.unlink(missing_ok=True)
             except OSError as exc:
                 self._record_retention_error(exc)
+        _fsync_dir(self.runs_dir)
         with self._lock:
             record = self._records.get(worker_id)
             if record is not None and record.status in TERMINAL_STATUSES:
@@ -1234,18 +1680,24 @@ class AgyManager:
         return bundles
 
     def _enforce_retention_once(self) -> None:
+        self._gc_stale_runtime_locks()
+        self._gc_stale_temporary_files()
+
         cutoff = time.time() - self.retention_days * 86400
         for modified, worker_id, _paths in self._terminal_bundles():
             if modified < cutoff:
                 self._delete_terminal_bundle(worker_id)
 
         limit_bytes = self.max_total_storage_mb * 1024 * 1024
-        files = [
-            path
-            for path in self.runs_dir.iterdir()
-            if path.is_file() and not path.is_symlink()
-        ]
-        total = sum(path.stat().st_size for path in files)
+        try:
+            files = [
+                path
+                for path in self.runs_dir.iterdir()
+                if path.is_file() and not path.is_symlink()
+            ]
+            total = sum(path.stat().st_size for path in files)
+        except OSError:
+            return
         if total <= limit_bytes:
             return
         for _modified, worker_id, paths in self._terminal_bundles():
@@ -1387,9 +1839,83 @@ class AgyManager:
                 raw_specs.append({**common_defaults, **dict(task)})
         else:
             raw_specs = [args]
+
         default_workdir = kwargs.get("workdir") or kwargs.get("cwd")
         specs = [self._task_spec(dict(raw), default_workdir) for raw in raw_specs]
-        records = [self._new_record(owner_id, spec) for spec in specs]
+
+        records: list[RunRecord] = []
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("delegate-agy is shutting down")
+            if self._executor is None:
+                raise RuntimeError("delegate-agy executor is unavailable")
+
+            # Check backpressure limits atomically
+            active_global = sum(1 for r in self._records.values() if r.status not in TERMINAL_STATUSES)
+            if active_global + len(specs) > self.max_pending_workers:
+                raise ValueError(
+                    f"Global worker capacity exceeded: maximum pending workers is {self.max_pending_workers}"
+                )
+            active_owner = sum(
+                1 for r in self._records.values() if r.owner_id == owner_id and r.status not in TERMINAL_STATUSES
+            )
+            if active_owner + len(specs) > self.max_pending_per_owner:
+                raise ValueError(
+                    f"Session worker capacity exceeded: maximum pending workers per session is {self.max_pending_per_owner}"
+                )
+
+            # Transactional spawn: reserve all records and submit
+            try:
+                for spec in specs:
+                    worker_id = f"agy_{uuid.uuid4().hex[:12]}"
+                    record = RunRecord(
+                        worker_id=worker_id,
+                        owner_id=owner_id,
+                        runtime_id=self.runtime_id,
+                        supervisor_pid=self.supervisor_pid,
+                        supervisor_started_at=self.supervisor_started_at,
+                        **spec,
+                    )
+                    records.append(record)
+                    try:
+                        self._write_record(record)
+                    except OSError as exc:
+                        try:
+                            self._record_path(record.worker_id).unlink(missing_ok=True)
+                        except OSError:
+                            pass
+                        raise RuntimeError(f"Initial persistence failed: {exc}") from exc
+                    self._records[worker_id] = record
+
+                for record in records:
+                    future = self._executor.submit(self._supervise_worker, record.worker_id)
+                    self._futures[record.worker_id] = future
+                    future.add_done_callback(
+                        lambda completed, target=record.worker_id: self._future_done(target, completed)
+                    )
+            except BaseException as exc:
+                # Compensate already prepared workers
+                for record in records:
+                    future = self._futures.pop(record.worker_id, None)
+                    if future is not None:
+                        future.cancel()
+                    self._records.pop(record.worker_id, None)
+                    record.cancel_requested = True
+                    ownership = self._processes.get(record.worker_id)
+                    if ownership is not None:
+                        self._drop_process_if_quiescent(record.worker_id, ownership, terminate=True)
+                    record.status = "failed"
+                    record.finished_at = _now()
+                    record.error = f"Could not submit worker: {exc}"
+                    try:
+                        self._record_path(record.worker_id).unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                compensated_ids = [r.worker_id for r in records]
+                raise RuntimeError(
+                    f"Could not submit worker ({len(compensated_ids)} workers compensated: {compensated_ids}): {exc}"
+                ) from exc
+
         if bool(args.get("wait", False)):
             default_wait = max(record.timeout_seconds for record in records)
             waves = math.ceil(len(records) / self.max_concurrent)
@@ -1482,11 +2008,13 @@ class AgyManager:
 
     def _steer(self, args: dict[str, Any], owner_id: str) -> dict[str, Any]:
         worker_id = self._validate_text(args.get("worker_id"), "worker_id", required=True)
-        message = self._validate_text(args.get("message"), "message", required=True)
+        message = self._validate_text(args.get("message"), "message", required=True, max_len=self.max_steer_message_chars)
         record = self._owned_record(owner_id, worker_id)
         with self._lock:
             if record.status in TERMINAL_STATUSES:
                 raise ValueError("Worker already finished. Use action=continue instead.")
+            if len(record.steer_queue) >= self.max_steer_queue_size:
+                raise ValueError(f"Steer queue is full: maximum is {self.max_steer_queue_size} messages")
             record.steer_queue.append(message)
             self._write_record(record)
         return {
@@ -1499,7 +2027,7 @@ class AgyManager:
 
     def _continue(self, args: dict[str, Any], owner_id: str, kwargs: dict[str, Any]) -> dict[str, Any]:
         worker_id = self._validate_text(args.get("worker_id"), "worker_id", required=True)
-        message = self._validate_text(args.get("message"), "message", required=True)
+        message = self._validate_text(args.get("message"), "message", required=True, max_len=64000)
         source = self._owned_record(owner_id, worker_id)
         if source.status not in TERMINAL_STATUSES:
             raise ValueError("Worker is still active. Use action=steer instead.")
@@ -1520,12 +2048,44 @@ class AgyManager:
             "timeout_seconds": args.get("timeout_seconds") or source.timeout_seconds,
         }
         spec = self._task_spec(raw_spec, kwargs.get("workdir") or kwargs.get("cwd"))
-        record = self._new_record(
-            owner_id,
-            spec,
-            conversation_id=source.conversation_id,
-            parent_worker_id=source.worker_id,
-        )
+
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("delegate-agy is shutting down")
+            if self._executor is None:
+                raise RuntimeError("delegate-agy executor is unavailable")
+            active_global = sum(1 for r in self._records.values() if r.status not in TERMINAL_STATUSES)
+            if active_global + 1 > self.max_pending_workers:
+                raise ValueError(
+                    f"Global worker capacity exceeded: maximum pending workers is {self.max_pending_workers}"
+                )
+            active_owner = sum(
+                1 for r in self._records.values() if r.owner_id == owner_id and r.status not in TERMINAL_STATUSES
+            )
+            if active_owner + 1 > self.max_pending_per_owner:
+                raise ValueError(
+                    f"Session worker capacity exceeded: maximum pending workers per session is {self.max_pending_per_owner}"
+                )
+
+            new_worker_id = f"agy_{uuid.uuid4().hex[:12]}"
+            record = RunRecord(
+                worker_id=new_worker_id,
+                owner_id=owner_id,
+                conversation_id=source.conversation_id,
+                parent_worker_id=source.worker_id,
+                runtime_id=self.runtime_id,
+                supervisor_pid=self.supervisor_pid,
+                supervisor_started_at=self.supervisor_started_at,
+                **spec,
+            )
+            self._write_record(record)
+            self._records[new_worker_id] = record
+            future = self._executor.submit(self._supervise_worker, new_worker_id)
+            self._futures[new_worker_id] = future
+            future.add_done_callback(
+                lambda completed, target=new_worker_id: self._future_done(target, completed)
+            )
+
         if bool(args.get("wait", False)):
             wait_timeout = self._bounded_int(
                 args.get("wait_timeout_seconds", record.timeout_seconds + 60),
@@ -1653,6 +2213,7 @@ class AgyManager:
             else:
                 self._ensure_resource_reaper()
 
+
 def register_tools(ctx) -> None:
     """Register delegate_agy for CLI/TUI preloading."""
     if __package__:
@@ -1662,28 +2223,35 @@ def register_tools(ctx) -> None:
 
     settings = {
         "max_concurrent": ctx.get_config("max_concurrent", 3),
+        "max_pending_workers": ctx.get_config("max_pending_workers", 20),
+        "max_pending_per_owner": ctx.get_config("max_pending_per_owner", 10),
         "default_timeout_seconds": ctx.get_config("default_timeout_seconds", 600),
         "max_result_chars": ctx.get_config("max_result_chars", 24000),
         "max_records_in_memory": ctx.get_config("max_records_in_memory", 500),
         "max_raw_output_bytes": ctx.get_config("max_raw_output_bytes", 16 * 1024 * 1024),
         "retention_days": ctx.get_config("retention_days", 30),
         "max_total_storage_mb": ctx.get_config("max_total_storage_mb", 1024),
-        "allow_accept_edits": ctx.get_config("allow_accept_edits", True),
+        "allow_accept_edits": ctx.get_config("allow_accept_edits", False),
     }
-    manager = AgyManager(settings=settings)
+    manager = None
     try:
+        manager = AgyManager(settings=settings)
         ctx.on_unload(manager.shutdown)
         registration = ctx.register_tool(
             name="delegate_agy",
             toolset="delegate_agy",
             schema=DELEGATE_AGY_SCHEMA,
             handler=manager.handle,
-            check_fn=lambda: shutil.which("agy") is not None,
+            check_fn=lambda: _check_agy_executable(manager.agy_path)[0],
             description="Delegate tasks to model-routed Antigravity CLI workers.",
             emoji="🛰️",
         )
         if registration is None:
             raise RuntimeError("Hermes rejected delegate_agy tool registration")
-    except Exception:
-        manager.shutdown()
+    except BaseException:
+        if manager is not None:
+            try:
+                manager.shutdown()
+            except BaseException:
+                pass
         raise

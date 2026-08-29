@@ -126,6 +126,7 @@ class UnitMockTests(unittest.TestCase):
                 "conv_12345",
                 "--effort",
                 "high",
+                "--mode=accept-edits",
                 "--dangerously-skip-permissions",
             ],
         )
@@ -159,8 +160,8 @@ class UnitMockTests(unittest.TestCase):
                 "json",
                 "--print-timeout",
                 "90s",
+                "--mode=plan",
                 "--sandbox",
-                "--dangerously-skip-permissions",
             ],
         )
 

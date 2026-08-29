@@ -35,7 +35,11 @@ class BatchAndOwnershipTests(unittest.TestCase):
         )
         self.fake_agy.chmod(0o755)
         self.manager = AgyManager(
-            settings={"max_concurrent": 2, "default_timeout_seconds": 60},
+            settings={
+                "max_concurrent": 2,
+                "default_timeout_seconds": 60,
+                "allow_accept_edits": True,
+            },
             agy_path=str(self.fake_agy),
         )
 
@@ -181,7 +185,7 @@ class BatchAndOwnershipTests(unittest.TestCase):
             "92s",
         )
         self.assertIn("--sandbox", observed["argv"])
-        self.assertNotIn("--mode", observed["argv"])
+        self.assertIn("--mode=plan", observed["argv"])
 
     def test_batch_rejects_non_mapping_items_clearly(self):
         response = json.loads(

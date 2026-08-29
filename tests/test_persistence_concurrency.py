@@ -398,15 +398,9 @@ class PersistenceConcurrencyTests(unittest.TestCase):
 
     def test_post_replace_initial_persistence_failure_removes_published_json(self):
         manager = AgyManager(settings={"max_concurrent": 1}, agy_path=str(self.fake_agy))
-        original_chmod = os.chmod
-
-        def fail_record_chmod(path, mode):
-            if str(path).endswith(".json"):
-                raise OSError("injected chmod failure after replace")
-            return original_chmod(path, mode)
 
         try:
-            with patch("tools.os.chmod", side_effect=fail_record_chmod):
+            with patch("tools._fsync_dir", side_effect=OSError("injected fsync failure after replace")):
                 response = json.loads(
                     manager.handle(
                         {

@@ -20,3 +20,6 @@ runs/
 .env.*
 *.pem
 *.key
+
+# Agent artifacts
+.agents/

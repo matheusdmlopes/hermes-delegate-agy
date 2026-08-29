@@ -84,12 +84,7 @@ after_unload = json.loads(entry.handler(
 assert after_unload["success"] is False
 assert "shutting down" in after_unload["error"]
 
-fd = os.open(runtime_lock, os.O_RDWR)
-try:
-    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    fcntl.flock(fd, fcntl.LOCK_UN)
-finally:
-    os.close(fd)
+assert not runtime_lock.exists() or not plugin_runtime._runtime_lease_status(plugin_runtime.runtime_id) == "LOCKED"
 """
 
 

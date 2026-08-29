@@ -38,9 +38,9 @@ _TASK_PROPERTIES = {
         "type": "string",
         "enum": ["sandbox", "accept_edits"],
         "description": (
-            "sandbox constrains terminal execution and is the default for tasks not "
-            "intended to change files. Use accept_edits only when the user's task "
-            "explicitly requires the worker to modify files."
+            "sandbox runs in plan mode with terminal sandboxing and restricted permissions "
+            "(default). Use accept_edits only when file modifications are explicitly required; "
+            "it requires allow_accept_edits: true in plugin settings."
         ),
     },
     "effort": {

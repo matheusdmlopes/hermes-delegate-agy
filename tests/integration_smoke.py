@@ -60,6 +60,7 @@ def main():
                     "max_concurrent": 3,
                     "default_timeout_seconds": 180,
                     "max_result_chars": 24000,
+                    "allow_accept_edits": True,
                 }
             )
             summary = {}
@@ -72,6 +73,7 @@ def main():
                     manager,
                     {
                         "action": "spawn",
+                        "execution_mode": "accept_edits",
                         "tasks": [
                             {
                                 "goal": "Respond exactly: WORKER_ALPHA",
@@ -135,6 +137,7 @@ def main():
                         "action": "spawn",
                         "goal": "Use the terminal to run sleep 3, then respond exactly: FIRST_PASS",
                         "task_type": "simple",
+                        "execution_mode": "accept_edits",
                         "workdir": workdir,
                         "timeout_seconds": 180,
                     },
