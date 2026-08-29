@@ -22,7 +22,7 @@ It enables the primary Hermes agent to spawn asynchronous or blocking background
            │
            ▼
     Official `agy` CLI Binary Subprocess
-    (--model, --sandbox / --mode accept-edits, --output-format json)
+    (--model, optional --sandbox, --dangerously-skip-permissions, JSON output)
            │
            ▼
     Antigravity Native Quota / Auth / Providers
@@ -49,9 +49,10 @@ which agy
 agy models
 ```
 
-Start or restart Hermes:
+Enable the plugin, then start or restart Hermes:
 
 ```bash
+hermes plugins enable delegate-agy
 hermes
 ```
 
@@ -80,6 +81,41 @@ When delegating, Hermes selects a `task_type` which routes to an appropriate mod
 - **`sandbox` (Default)**: Runs `agy` with `--sandbox --dangerously-skip-permissions`. Constrains terminal execution for read-only / diagnostic tasks while avoiding interactive prompt deadlocks.
 - **`accept_edits`**: Runs `agy` in full YOLO mode (`--dangerously-skip-permissions` without sandbox). Allows full file creation, editing, patching, and unrestricted terminal commands.
 
+`accept_edits` is enabled by default for 0.2.0 compatibility. To prohibit unrestricted edit workers, set `allow_accept_edits: false`; requests for that mode then return a structured error before any process starts.
+
+## ⚙️ Plugin Settings
+
+Settings live under the plugin entry in `config.yaml`:
+
+```yaml
+plugins:
+  entries:
+    delegate-agy:
+      settings:
+        max_concurrent: 3
+        default_timeout_seconds: 600
+        max_result_chars: 24000
+        max_records_in_memory: 500
+        max_raw_output_bytes: 16777216
+        retention_days: 30
+        max_total_storage_mb: 1024
+        allow_accept_edits: true
+```
+
+- `max_concurrent` bounds parallel workers from 1 to 10.
+- `default_timeout_seconds` bounds a print run when the call omits a timeout.
+- `max_result_chars` limits the response returned to Hermes; the raw artifact path remains available.
+- `max_records_in_memory` limits recent terminal records while active records are always retained.
+- `max_raw_output_bytes` limits each stdout or stderr artifact.
+- `retention_days` and `max_total_storage_mb` bound terminal artifacts on disk. Active records are never deleted.
+- `allow_accept_edits` controls whether unrestricted edit mode may start.
+
+## 💾 Storage and Recovery
+
+Records are stored in the active Hermes profile under `plugin-data/delegate-agy/runs/`; runtime leases live under `plugin-data/delegate-agy/runtime/`. Record publication is atomic, files are private (`0600`), and directories use `0700`.
+
+Each Hermes runtime holds an exclusive lease. A second live runtime does not interrupt or claim its workers. After an unclean exit releases that lease, the next runtime marks unfinished records as `interrupted`. Legacy terminal records remain readable. Steering writes attempt-specific artifacts such as `agy_<id>.turn-001.stdout` and `agy_<id>.turn-002.stdout`.
+
 ---
 
 ## 🛠️ Actions Reference
@@ -97,12 +133,20 @@ When delegating, Hermes selects a `task_type` which routes to an appropriate mod
 
 ## 🧪 Testing
 
-Run the zero-quota unit mock test suite:
+Run the complete zero-quota fake/mock suite:
 
 ```bash
-python3 -m pytest tests/test_unit_mock.py -v
-python3 -m pytest tests/test_process_groups.py -v
+PYTHONDONTWRITEBYTECODE=1 pytest \
+  tests/test_unit_mock.py \
+  tests/test_process_groups.py \
+  tests/test_batch_and_ownership.py \
+  tests/test_persistence_concurrency.py \
+  tests/test_shutdown_lifecycle.py \
+  tests/test_hermes_contract.py \
+  -v -p no:cacheprovider
 ```
+
+`tests/integration_smoke.py` invokes the real authenticated `agy` service and consumes Antigravity quota. Run it only when live quota consumption is explicitly intended.
 
 ---
 

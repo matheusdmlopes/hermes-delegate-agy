@@ -7,12 +7,9 @@ import os
 
 def register(ctx) -> None:
     """Register the delegate_agy tool and its supervised process manager."""
-    try:
-        # When loaded as a proper package (plugin system)
+    if __package__:
         from .tools import register_tools
-    except ImportError:
-        # Fallback for when the module is loaded as a script (e.g., by pytest)
-        # Add the plugin directory to sys.path so `tools` can be imported
+    else:
         plugin_dir = os.path.dirname(__file__)
         if plugin_dir not in os.sys.path:
             os.sys.path.insert(0, plugin_dir)

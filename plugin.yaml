@@ -1,8 +1,12 @@
 name: delegate-agy
-version: 0.1.0
+version: 0.2.0
 description: "Delegate tasks from Hermes to Antigravity CLI workers with per-task model routing, parallel execution, continuation, steering queue, and process control."
 author: matheusdmlopes
-kind: backend
+kind: standalone
+license: MIT
+homepage: https://github.com/matheusdmlopes/hermes-delegate-agy
+external_dependencies:
+  - agy
 platforms:
   - linux
   - macos
