@@ -218,11 +218,8 @@ class BatchAndOwnershipTests(unittest.TestCase):
 
         self.assertFalse(response["success"], response)
         record_paths = list(self.manager.runs_dir.glob("agy_*.json"))
-        self.assertEqual(len(record_paths), 1)
-        durable = json.loads(record_paths[0].read_text(encoding="utf-8"))
-        self.assertEqual(durable["status"], "failed")
-        self.assertIsNotNone(durable["finished_at"])
-        self.assertIn("submit", durable["error"].lower())
+        self.assertEqual(len(record_paths), 0)
+        self.assertEqual(self.manager._records, {})
 
     def test_old_terminal_worker_reloads_after_memory_eviction(self):
         self.manager.shutdown()

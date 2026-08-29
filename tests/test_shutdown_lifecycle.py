@@ -261,6 +261,9 @@ class ShutdownLifecycleTests(unittest.TestCase):
             agy_path=str(script),
         )
         self.managers.append(manager)
+        # The constructor probes the fake executable with --version; the stress
+        # assertion below counts worker spawns only.
+        pid_log.unlink(missing_ok=True)
         fd_dir = Path("/proc/self/fd")
         baseline_fds = len(list(fd_dir.iterdir())) if fd_dir.is_dir() else None
 
@@ -277,6 +280,7 @@ class ShutdownLifecycleTests(unittest.TestCase):
                             }
                             for index in range(10)
                         ],
+                        "wait": True,
                     },
                     session_id="shutdown-session",
                 )

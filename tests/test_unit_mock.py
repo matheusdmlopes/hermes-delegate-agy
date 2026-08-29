@@ -162,8 +162,40 @@ class UnitMockTests(unittest.TestCase):
                 "90s",
                 "--mode=plan",
                 "--sandbox",
+                "--dangerously-skip-permissions",
             ],
         )
+
+    def test_success_payload_requires_nonempty_response(self):
+        record = RunRecord(
+            worker_id="agy_empty_success",
+            owner_id="session1",
+            goal="Do task",
+            context="",
+            prompt="Prompt content",
+            task_type="simple",
+            model="gemini-3.7-flash-low",
+            execution_mode="sandbox",
+            effort=None,
+            workdir="/tmp/test",
+            timeout_seconds=60,
+        )
+        payload = {
+            "status": "SUCCESS",
+            "response": "",
+            "conversation_id": "conv-empty",
+        }
+
+        self.assertFalse(
+            self.manager._interpret_payload(
+                record,
+                payload,
+                returncode=0,
+                stdout=json.dumps(payload),
+                stderr='jetski: no output produced — permission auto-denied',
+            )
+        )
+        self.assertIn("no output produced", record.error or "")
 
     def test_parse_payload_variations(self):
         payload = {"status": "SUCCESS", "response": "Done", "conversation_id": "c1"}
@@ -248,7 +280,11 @@ class UnitMockTests(unittest.TestCase):
         )
         mock_proc.poll.return_value = 0
 
-        with patch("subprocess.Popen", return_value=mock_proc):
+        with patch("subprocess.Popen", return_value=mock_proc), patch.object(
+            self.manager,
+            "_drain_and_stream",
+            return_value=(*mock_proc.communicate.return_value, None),
+        ):
             res = self.manager._execute_once(record, record.prompt)
             self.assertTrue(res)
             self.assertEqual(record.conversation_id, "conv_999")
@@ -265,7 +301,11 @@ class UnitMockTests(unittest.TestCase):
             }),
             "",
         )
-        with patch("subprocess.Popen", return_value=mock_proc):
+        with patch("subprocess.Popen", return_value=mock_proc), patch.object(
+            self.manager,
+            "_drain_and_stream",
+            return_value=(*mock_proc.communicate.return_value, None),
+        ):
             res = self.manager._execute_once(record, record.prompt)
             self.assertFalse(res)
             self.assertIn("Model quota exhausted", record.error)
@@ -293,7 +333,11 @@ class UnitMockTests(unittest.TestCase):
             "process failed",
         )
 
-        with patch("subprocess.Popen", return_value=mock_proc):
+        with patch("subprocess.Popen", return_value=mock_proc), patch.object(
+            self.manager,
+            "_drain_and_stream",
+            return_value=(*mock_proc.communicate.return_value, None),
+        ):
             self.assertFalse(self.manager._execute_once(record, record.prompt))
 
         self.assertIn("return code 7", record.error)
@@ -327,7 +371,11 @@ class UnitMockTests(unittest.TestCase):
             "generic stderr fallback",
         )
 
-        with patch("subprocess.Popen", return_value=mock_proc):
+        with patch("subprocess.Popen", return_value=mock_proc), patch.object(
+            self.manager,
+            "_drain_and_stream",
+            return_value=(*mock_proc.communicate.return_value, None),
+        ):
             self.assertFalse(self.manager._execute_once(record, record.prompt))
 
         self.assertIn("structured quota diagnosis", record.error)
@@ -365,7 +413,11 @@ class UnitMockTests(unittest.TestCase):
             "",
         )
 
-        with patch("subprocess.Popen", return_value=mock_proc):
+        with patch("subprocess.Popen", return_value=mock_proc), patch.object(
+            self.manager,
+            "_drain_and_stream",
+            return_value=(*mock_proc.communicate.return_value, None),
+        ):
             self.assertTrue(self.manager._execute_once(record, record.prompt))
 
         self.assertEqual(record.response, "forward compatible")
@@ -396,7 +448,11 @@ class UnitMockTests(unittest.TestCase):
             "",
         )
 
-        with patch("subprocess.Popen", return_value=mock_proc):
+        with patch("subprocess.Popen", return_value=mock_proc), patch.object(
+            self.manager,
+            "_drain_and_stream",
+            return_value=(*mock_proc.communicate.return_value, None),
+        ):
             self.assertFalse(self.manager._execute_once(record, record.prompt))
 
         self.assertIn("status PARTIAL", record.error)
@@ -462,7 +518,10 @@ class UnitMockTests(unittest.TestCase):
         ctx_mock = MagicMock()
         ctx_mock.get_config.side_effect = lambda k, d: d
 
-        with patch("shutil.which", return_value="/usr/bin/agy"):
+        with patch(
+            "tools._check_agy_executable",
+            return_value=(True, "/usr/bin/agy", None),
+        ):
             register_tools(ctx_mock)
             ctx_mock.register_tool.assert_called_once()
             kw = ctx_mock.register_tool.call_args.kwargs

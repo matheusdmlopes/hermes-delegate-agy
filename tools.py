@@ -98,121 +98,181 @@ ALLOWLIST_ENV_KEYS = {
     "LANG",
     "LANGUAGE",
     "LC_ALL",
-    "LC_CTYPE",
-    "LC_MESSAGES",
+    "LC_ADDRESS",
     "LC_COLLATE",
+    "LC_CTYPE",
+    "LC_IDENTIFICATION",
+    "LC_MEASUREMENT",
+    "LC_MESSAGES",
+    "LC_MONETARY",
+    "LC_NAME",
+    "LC_NUMERIC",
+    "LC_PAPER",
+    "LC_TELEPHONE",
+    "LC_TIME",
     "TERM",
     "COLORTERM",
-    "SSH_AUTH_SOCK",
-    "XDG_RUNTIME_DIR",
     "XDG_CONFIG_HOME",
     "XDG_DATA_HOME",
     "XDG_CACHE_HOME",
 }
 
-_AGY_PROBE_CACHE: dict[str, tuple[bool, str | None, str | None]] = {}
+_AGY_PROBE_CACHE: dict[
+    tuple[str, int, int, int, int], tuple[bool, str | None, str | None]
+] = {}
 _AGY_PROBE_LOCK = threading.Lock()
 
-# Pattern used by the "script" env strategy to strip any var that looks
-# like a secret. Order matters: substring match, so place longer/more
-# specific fragments first to avoid accidental shadowing.
-_SECRET_DENY_SUBSTRINGS: tuple[str, ...] = (
-    "HERMES_",
-    "ANTHROPIC_",
-    "OPENAI_",
-    "CLAUDE_",
-    "AWS_",
-    "GITHUB_TOKEN",
-    "SECRET",
-    "TOKEN",
-    "PASSWORD",
-    "LD_PRELOAD",
-    "LD_LIBRARY_PATH",
-    "DYLD_",
-    "PYTHONPATH",
-    "PYTHONHOME",
+# Native signatures are informational only. Unknown formats use the same strict
+# environment, so classification never widens the subprocess environment.
+_NATIVE_MAGIC: tuple[bytes, ...] = (
+    b"\x7fELF",          # ELF
+    b"\xce\xfa\xed\xfe", # Mach-O 32-bit little-endian
+    b"\xcf\xfa\xed\xfe", # Mach-O 64-bit little-endian
+    b"\xfe\xed\xfa\xce", # Mach-O 32-bit big-endian
+    b"\xfe\xed\xfa\xcf", # Mach-O 64-bit big-endian
+    b"\xca\xfe\xba\xbe", # Mach-O fat 32-bit big-endian
+    b"\xbe\xba\xfe\xca", # Mach-O fat 32-bit little-endian
+    b"\xca\xfe\xba\xbf", # Mach-O fat 64-bit big-endian
+    b"\xbf\xba\xfe\xca", # Mach-O fat 64-bit little-endian
+    b"MZ",               # DOS header used by PE executables
 )
 
-# Magic byte signatures that identify a native executable on the major
-# platforms we support. We only need a tiny sniff to disambiguate native
-# binaries from interpreter shim scripts.
-_NATIVE_MAGIC: tuple[bytes, ...] = (
-    b"\x7fELF",                  # Linux / BSD ELF
-    b"\xfe\xed\xfa\xce",         # Mach-O 32-bit
-    b"\xfe\xed\xfa\xcf",         # Mach-O 64-bit
-    b"\xfe\xed\xfe\xed",         # Mach-O universal
-    b"MZ",                       # Windows PE (we do not run this on win
-                                 # but it is not a shim script either)
-)
+_MANAGER_RESOLVERS: dict[str, tuple[str, ...]] = {
+    "mise": ("which", "agy"),
+    "rtx": ("which", "agy"),
+    "asdf": ("which", "agy"),
+}
+
+
+def _is_known_native_magic(head: bytes) -> bool:
+    return any(head.startswith(magic) for magic in _NATIVE_MAGIC)
 
 
 def _classify_agy_target(path: str) -> str:
-    """Return 'script' if the agy executable at ``path`` is a shim script
-    (any file whose first bytes form a ``#!`` shebang), 'native' otherwise.
+    """Classify a valid byte-zero shebang as script, otherwise strict/native.
 
-    The "native" branch is the safe default: when in doubt, treat the
-    target as a closed binary and use the strict allowlist env so Hermes
-    secrets never leak to a worker we cannot reason about.
+    POSIX direct execution requires ``#!`` at byte zero. Unknown, missing,
+    padded, or BOM-prefixed files deliberately use the strict native fallback.
     """
     try:
         with open(path, "rb") as fh:
             head = fh.read(4)
     except OSError:
         return "native"
-    if not head:
-        return "native"
-    # Shim scripts: any leading whitespace is tolerated, then a '#!'.
-    stripped = head.lstrip()
-    if stripped.startswith(b"#!"):
+    if head.startswith(b"#!"):
         return "script"
-    if any(head.startswith(magic) for magic in _NATIVE_MAGIC):
-        return "native"
-    # Unknown format. Default to the safer allowlist path.
     return "native"
 
 
 def _build_env_allowlist() -> dict[str, str]:
-    """Strict allowlist env. Used for native agy binaries that do not
-    need any context from the parent shell."""
-    sanitized: dict[str, str] = {}
-    for k, v in os.environ.items():
-        if k in ALLOWLIST_ENV_KEYS or (k.startswith("LC_") and len(k) < 32):
-            if any(bad in k for bad in _SECRET_DENY_SUBSTRINGS):
-                continue
-            sanitized[k] = v
-    return sanitized
-
-
-def _build_env_denylist() -> dict[str, str]:
-    """Inherit the parent env, then drop anything that looks like a
-    secret. Used for shim wrappers (mise/asdf/rtx/nix/brew) that need
-    loader context to resolve the real agy binary."""
-    sanitized: dict[str, str] = {}
-    for k, v in os.environ.items():
-        if any(bad in k for bad in _SECRET_DENY_SUBSTRINGS):
-            continue
-        sanitized[k] = v
+    """Return the complete positive allowlist used by every agy subprocess."""
+    sanitized = {
+        key: value for key, value in os.environ.items() if key in ALLOWLIST_ENV_KEYS
+    }
+    raw_path = sanitized.get("PATH", os.defpath)
+    absolute_entries = [
+        entry for entry in raw_path.split(os.pathsep) if entry and os.path.isabs(entry)
+    ]
+    sanitized["PATH"] = os.pathsep.join(absolute_entries) or os.defpath
     return sanitized
 
 
 def _build_env_for_target(target_path: str, kind: str) -> dict[str, str]:
-    """Select the env strategy for a given agy target and kind.
+    """Return the strict env for every target and format.
 
-    This is split out from ``_execute_once`` so it can be tested in
-    isolation, without spawning a real subprocess.
+    ``target_path`` and ``kind`` remain accepted for API compatibility, but no
+    classification can widen the environment anymore.
     """
-    if kind == "script":
-        return _build_env_denylist()
+    del target_path, kind
     return _build_env_allowlist()
 
 
 def _build_env_for_agy(agy_path: str) -> dict[str, str]:
-    """Public dispatch used by ``_execute_once``: classify the agy
-    binary, then build the matching env. The kind is computed at spawn
-    time so a user who replaces the shim with a real binary does not
-    need to restart Hermes to get the new strategy."""
-    kind = _classify_agy_target(agy_path)
-    return _build_env_for_target(agy_path, kind)
+    """Return the strict env used for resolution, probes, and worker spawns."""
+    return _build_env_for_target(agy_path, _classify_agy_target(agy_path))
+
+
+def _read_wrapper_text(path: str) -> str:
+    try:
+        with open(path, "rb") as fh:
+            return fh.read(8192).decode("utf-8", errors="ignore")
+    except OSError:
+        return ""
+
+
+def _resolve_agy_target(path: str) -> str:
+    """Resolve known version-manager wrappers without inheriting their state.
+
+    Generic scripts are allowed, but still execute with the strict env. Known
+    mise/rtx/asdf wrappers fail closed when their real target cannot be found,
+    avoiding the original headless hang and any need to pass opaque manager
+    variables such as ``__MISE_DIFF``.
+    """
+    canonical_path = str(Path(path).expanduser().resolve())
+    if _classify_agy_target(canonical_path) != "script":
+        return canonical_path
+
+    wrapper_text = _read_wrapper_text(canonical_path)
+    managers = [
+        manager
+        for manager in _MANAGER_RESOLVERS
+        if re.search(rf"(?<![A-Za-z0-9_-]){re.escape(manager)}(?![A-Za-z0-9_-])", wrapper_text)
+    ]
+    if not managers:
+        return canonical_path
+
+    strict_env = _build_env_allowlist()
+    errors: list[str] = []
+    for manager in managers:
+        manager_path = shutil.which(manager, path=strict_env.get("PATH"))
+        if manager_path is None:
+            errors.append(f"{manager} not found on strict PATH")
+            continue
+        try:
+            proc = subprocess.run(
+                [manager_path, *_MANAGER_RESOLVERS[manager]],
+                cwd=strict_env.get("HOME") or None,
+                env=strict_env,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=5.0,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            errors.append(f"{manager}: {exc}")
+            continue
+
+        lines = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+        if proc.returncode != 0 or len(lines) != 1:
+            detail = proc.stderr.strip() or f"exit {proc.returncode}"
+            errors.append(f"{manager}: {detail[:200]}")
+            continue
+
+        raw_candidate = lines[0]
+        if not os.path.isabs(raw_candidate):
+            errors.append(f"{manager}: resolver returned a non-absolute path")
+            continue
+        candidate = str(Path(raw_candidate).expanduser().resolve())
+        if (
+            candidate != canonical_path
+            and os.path.isabs(candidate)
+            and os.path.isfile(candidate)
+            and os.access(candidate, os.X_OK)
+        ):
+            return candidate
+        errors.append(f"{manager}: invalid executable path")
+
+    detail = "; ".join(errors) or "no supported manager resolver succeeded"
+    raise RuntimeError(
+        f"Known agy wrapper could not resolve its real executable: {detail}. "
+        "Configure the plugin agy_path setting with the real executable path."
+    )
+
+
+def _probe_cache_key(path: str) -> tuple[str, int, int, int, int]:
+    st = os.stat(path)
+    return (path, st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
 
 
 def _now() -> str:
@@ -224,7 +284,7 @@ def _json_text(payload: dict[str, Any]) -> str:
 
 
 def _check_agy_executable(path_or_name: str | None) -> tuple[bool, str | None, str | None]:
-    """Verify presence, absolute canonical path, and capability of agy binary."""
+    """Resolve, strictly probe, and capability-check the agy executable."""
     target = path_or_name or "agy"
     which_path = shutil.which(target)
     if which_path is None:
@@ -233,25 +293,38 @@ def _check_agy_executable(path_or_name: str | None) -> tuple[bool, str | None, s
         else:
             return False, None, f"agy executable not found: {target}"
 
-    canonical_path = str(Path(which_path).expanduser().resolve())
-    with _AGY_PROBE_LOCK:
-        if canonical_path in _AGY_PROBE_CACHE:
-            return _AGY_PROBE_CACHE[canonical_path]
+    try:
+        canonical_path = _resolve_agy_target(which_path)
+    except (OSError, RuntimeError) as exc:
+        return False, str(Path(which_path).expanduser()), str(exc)
 
     if not os.path.isfile(canonical_path) or not os.access(canonical_path, os.X_OK):
-        res = (False, canonical_path, f"Resolved agy path is not an executable file: {canonical_path}")
-        with _AGY_PROBE_LOCK:
-            _AGY_PROBE_CACHE[canonical_path] = res
-        return res
+        return False, canonical_path, f"Resolved agy path is not an executable file: {canonical_path}"
+
+    try:
+        cache_key = _probe_cache_key(canonical_path)
+    except OSError as exc:
+        return False, canonical_path, f"Could not stat resolved agy executable: {exc}"
+
+    with _AGY_PROBE_LOCK:
+        cached = _AGY_PROBE_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
 
     try:
         proc = subprocess.run(
             [canonical_path, "--version"],
+            cwd=_build_env_allowlist().get("HOME") or None,
+            env=_build_env_allowlist(),
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
-            timeout=2.0,
+            timeout=5.0,
             check=False,
         )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        res = (False, canonical_path, f"Could not probe agy --version: {exc}")
+    else:
         combined_output = f"{proc.stdout} {proc.stderr}"
         match = _VERSION_RE.search(combined_output)
         if match is not None:
@@ -262,25 +335,19 @@ def _check_agy_executable(path_or_name: str | None) -> tuple[bool, str | None, s
                     canonical_path,
                     f"agy version {ver[0]}.{ver[1]}.{ver[2]} is below required minimum 1.1.8",
                 )
-                with _AGY_PROBE_LOCK:
-                    _AGY_PROBE_CACHE[canonical_path] = res
-                return res
-
-        if proc.returncode == 0 or match is not None:
+            elif proc.returncode == 0:
+                res = (True, canonical_path, None)
+            else:
+                res = (False, canonical_path, f"agy --version exited with {proc.returncode}")
+        elif proc.returncode == 0:
             res = (True, canonical_path, None)
-            with _AGY_PROBE_LOCK:
-                _AGY_PROBE_CACHE[canonical_path] = res
-            return res
+        else:
+            details = proc.stderr.strip() or proc.stdout.strip() or "no output"
+            res = (False, canonical_path, f"agy --version failed: {details[:500]}")
 
-        res = (True, canonical_path, None)
-        with _AGY_PROBE_LOCK:
-            _AGY_PROBE_CACHE[canonical_path] = res
-        return res
-    except Exception as exc:
-        res = (True, canonical_path, None)
-        with _AGY_PROBE_LOCK:
-            _AGY_PROBE_CACHE[canonical_path] = res
-        return res
+    with _AGY_PROBE_LOCK:
+        _AGY_PROBE_CACHE[cache_key] = res
+    return res
 
 
 def _fsync_dir(dir_path: Path) -> None:
@@ -413,7 +480,9 @@ class AgyManager:
             settings.get("max_steer_message_chars", 24000), default=24000, minimum=100, maximum=100000
         )
 
-        is_valid, canonical_agy, err = _check_agy_executable(agy_path)
+        self.agy_source = agy_path or "agy"
+        is_valid, canonical_agy, err = _check_agy_executable(self.agy_source)
+        self._refresh_agy_on_spawn = is_valid
         if is_valid and canonical_agy is not None:
             self.agy_path = canonical_agy
         else:
@@ -1101,9 +1170,11 @@ class AgyManager:
                 self._prune_records_locked()
             self._enforce_retention()
 
-    def _build_command(self, record: RunRecord, prompt: str) -> list[str]:
+    def _build_command(
+        self, record: RunRecord, prompt: str, agy_path: str | None = None
+    ) -> list[str]:
         command = [
-            self.agy_path,
+            agy_path or self.agy_path,
             "-p",
             prompt,
             "--add-dir",
@@ -1122,19 +1193,14 @@ class AgyManager:
         if record.execution_mode == "accept_edits":
             command.extend(["--mode=accept-edits", "--dangerously-skip-permissions"])
         else:
-            command.extend(["--mode=plan", "--sandbox"])
+            command.extend(
+                ["--mode=plan", "--sandbox", "--dangerously-skip-permissions"]
+            )
         return command
 
     @staticmethod
     def _build_sanitized_env(agy_path: str | None = None) -> dict[str, str]:
-        """Build the subprocess env, choosing allowlist or denylist based
-        on whether the agy binary is a native executable or a shim script.
-
-        Backwards-compatible: callers that do not know the path (legacy
-        probes, dry-runs) get the strict allowlist, which is the safer
-        fallback. The hot path (``_execute_once``) always passes the
-        real path so the script branch is selected when appropriate.
-        """
+        """Build the same strict positive allowlist for every agy target."""
         if not agy_path:
             return _build_env_allowlist()
         return _build_env_for_agy(agy_path)
@@ -1163,7 +1229,11 @@ class AgyManager:
             if any(k in candidate for k in forbidden_keys):
                 return False
 
-            has_response = isinstance(candidate.get("response"), str)
+            response = candidate.get("response")
+            has_response = (
+                isinstance(response, (str, int, float))
+                and not isinstance(response, bool)
+            )
             has_conv_id = isinstance(candidate.get("conversation_id"), str) and bool(candidate.get("conversation_id"))
             has_error = candidate.get("error") is not None and isinstance(candidate.get("error"), str)
             status = candidate.get("status")
@@ -1175,12 +1245,11 @@ class AgyManager:
                 return has_error
             if status is None:
                 return has_response or has_error or has_conv_id
+            if isinstance(status, str):
+                return has_response or has_error or has_conv_id
             return False
 
-        def _reject_constants(val: str):
-            raise ValueError(f"Invalid non-finite JSON constant: {val}")
-
-        decoder = json.JSONDecoder(parse_constant=_reject_constants)
+        decoder = json.JSONDecoder()
 
         try:
             payload, _ = decoder.raw_decode(cleaned)
@@ -1230,8 +1299,13 @@ class AgyManager:
             conversation_id = payload.get("conversation_id")
             if isinstance(conversation_id, str) and conversation_id:
                 record.conversation_id = conversation_id
-            if "response" in payload and isinstance(payload.get("response"), str):
-                resp_text, truncated = _truncate_utf8(payload["response"], self.max_result_chars)
+            raw_response = payload.get("response")
+            if (
+                "response" in payload
+                and isinstance(raw_response, (str, int, float))
+                and not isinstance(raw_response, bool)
+            ):
+                resp_text, truncated = _truncate_utf8(str(raw_response), self.max_result_chars)
                 record.response = resp_text
                 record.response_truncated = truncated or bool(payload.get("response_truncated", False))
             usage = payload.get("usage")
@@ -1248,6 +1322,7 @@ class AgyManager:
             returncode == 0
             and payload is not None
             and agy_status in {"SUCCESS", "SUCCEEDED", "DONE", "COMPLETED"}
+            and bool(record.response.strip())
         )
         if successful:
             record.error = None
@@ -1563,7 +1638,20 @@ class AgyManager:
         return stdout_str, stderr_str, drain_error
 
     def _execute_once(self, record: RunRecord, prompt: str) -> bool:
-        command = self._build_command(record, prompt)
+        spawn_agy_path = self.agy_path
+        if self._refresh_agy_on_spawn:
+            valid, refreshed_path, refresh_error = _check_agy_executable(self.agy_source)
+            if not valid or refreshed_path is None:
+                with self._lock:
+                    record.error = f"Could not refresh agy executable: {refresh_error}"
+                    record.returncode = None
+                    try:
+                        self._write_record(record)
+                    except OSError:
+                        pass
+                return False
+            spawn_agy_path = refreshed_path
+        command = self._build_command(record, prompt, agy_path=spawn_agy_path)
         creation: dict[str, Any] = {}
         if os.name == "posix":
             creation["start_new_session"] = True
@@ -1581,7 +1669,7 @@ class AgyManager:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=False,
-                env=self._build_sanitized_env(self.agy_path),
+                env=self._build_sanitized_env(spawn_agy_path),
                 **creation,
             )
         except OSError as exc:
@@ -2318,10 +2406,11 @@ def register_tools(ctx) -> None:
         "retention_days": ctx.get_config("retention_days", 30),
         "max_total_storage_mb": ctx.get_config("max_total_storage_mb", 1024),
         "allow_accept_edits": ctx.get_config("allow_accept_edits", False),
+        "agy_path": ctx.get_config("agy_path", None),
     }
     manager = None
     try:
-        manager = AgyManager(settings=settings)
+        manager = AgyManager(settings=settings, agy_path=settings["agy_path"])
         ctx.on_unload(manager.shutdown)
         registration = ctx.register_tool(
             name="delegate_agy",

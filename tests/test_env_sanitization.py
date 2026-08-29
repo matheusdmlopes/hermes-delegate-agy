@@ -1,24 +1,10 @@
-"""Tests for environment sanitization strategy in delegate-agy.
-
-The plugin must choose between two strategies for the subprocess env:
-
-  - "native"   -> the agy binary is an ELF/Mach-O executable. We can safely
-                  use a strict ALLOWLIST (Hermes secrets never reach the
-                  worker).
-  - "script"   -> the agy binary is a wrapper script (mise, asdf, rtx, nix,
-                  brew). The interpreter needs MISE_*/ASDF_*/etc to locate
-                  the real tool, so we use a strict DENYLIST instead and
-                  inherit the parent env, then strip known secret patterns.
-
-The classification is the heart of the fix: it lets the plugin keep its
-zero-leak guarantee on native installs while remaining functional on shim
-installs.
-"""
+"""Regression tests for strict agy environment and wrapper resolution."""
 
 from __future__ import annotations
 
+import json
 import os
-import stat
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -30,13 +16,9 @@ if str(PLUGIN_DIR) not in sys.path:
     sys.path.insert(0, str(PLUGIN_DIR))
 
 import tools
-from tools import AgyManager
 
 
 class ClassifyAgyTargetTests(unittest.TestCase):
-    """The classifier must return 'script' for any file whose first bytes
-    start with a #! shebang, and 'native' for any other executable file."""
-
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix="agy-classify-")
         self.addCleanup(self.tmp.cleanup)
@@ -48,148 +30,189 @@ class ClassifyAgyTargetTests(unittest.TestCase):
         path.chmod(mode)
         return path
 
-    def test_classifies_bash_shim_as_script(self):
-        path = self._write("agy", b"#!/bin/bash\nexec real-agy \"$@\"\n")
-        self.assertEqual(tools._classify_agy_target(str(path)), "script")
+    def test_only_real_posix_shebang_is_script(self):
+        script = self._write("script", b"#!/bin/sh\nexit 0\n")
+        padded = self._write("padded", b"  #!/bin/sh\nexit 0\n")
+        bom = self._write("bom", b"\xef\xbb\xbf#!/bin/sh\nexit 0\n")
 
-    def test_classifies_env_shim_as_script(self):
-        path = self._write("agy", b"#!/usr/bin/env bash\necho ok\n")
-        self.assertEqual(tools._classify_agy_target(str(path)), "script")
+        self.assertEqual(tools._classify_agy_target(str(script)), "script")
+        self.assertEqual(tools._classify_agy_target(str(padded)), "native")
+        self.assertEqual(tools._classify_agy_target(str(bom)), "native")
 
-    def test_classifies_elf_magic_as_native(self):
-        # ELF magic: 0x7F 'E' 'L' 'F'
-        path = self._write("agy", b"\x7fELF\x02\x01\x01\x00" + b"\x00" * 8)
-        self.assertEqual(tools._classify_agy_target(str(path)), "native")
+    def test_recognizes_native_magic_variants(self):
+        signatures = (
+            b"\x7fELF",
+            b"\xce\xfa\xed\xfe",
+            b"\xcf\xfa\xed\xfe",
+            b"\xfe\xed\xfa\xce",
+            b"\xfe\xed\xfa\xcf",
+            b"\xca\xfe\xba\xbe",
+            b"\xbe\xba\xfe\xca",
+            b"\xca\xfe\xba\xbf",
+            b"\xbf\xba\xfe\xca",
+            b"MZ\x00\x00",
+        )
+        for index, signature in enumerate(signatures):
+            with self.subTest(signature=signature.hex()):
+                path = self._write(f"native-{index}", signature + b"\x00" * 12)
+                self.assertEqual(tools._classify_agy_target(str(path)), "native")
+                self.assertTrue(tools._is_known_native_magic(signature))
 
-    def test_classifies_mach_o_magic_as_native(self):
-        # Mach-O 64-bit little-endian magic: 0xFEEDFACF
-        path = self._write("agy", b"\xcf\xfa\xed\xfe" + b"\x00" * 12)
-        self.assertEqual(tools._classify_agy_target(str(path)), "native")
-
-    def test_classifies_shebang_with_whitespace_as_script(self):
-        # Some shims have a leading whitespace before the shebang (rare but real).
-        path = self._write("agy", b"  #!/bin/sh\necho hi\n")
-        self.assertEqual(tools._classify_agy_target(str(path)), "script")
-
-    def test_classifies_non_executable_file_as_native_safe_fallback(self):
-        # If we cannot read the file or it is not executable, we must NOT
-        # silently fall back to inheriting the full env. Default to "native"
-        # so the allowlist path is used, which is the safer choice.
-        path = self.tmpdir / "missing"
-        result = tools._classify_agy_target(str(path))
-        self.assertEqual(result, "native")
+    def test_unknown_and_missing_targets_use_strict_fallback(self):
+        unknown = self._write("unknown", b"not-an-executable-format")
+        self.assertEqual(tools._classify_agy_target(str(unknown)), "native")
+        self.assertEqual(tools._classify_agy_target(str(self.tmpdir / "missing")), "native")
 
 
-class BuildEnvForTargetTests(unittest.TestCase):
-    """_build_env_for_target must select allowlist vs denylist per
-    classification, while still dropping every Hermes secret."""
-
+class StrictEnvironmentTests(unittest.TestCase):
     HOSTILE_ENV = {
         "PATH": "/usr/bin:/bin",
         "HOME": "/home/test",
         "USER": "tester",
-        "HERMES_API_KEY": "sk-hermes-leak",
-        "HERMES_SESSION_TOKEN": "tok-leak",
-        "OPENAI_API_KEY": "sk-openai-leak",
-        "ANTHROPIC_API_KEY": "sk-anthropic-leak",
-        "AWS_SECRET_ACCESS_KEY": "aws-leak",
-        "GITHUB_TOKEN": "gh-leak",
+        "LANG": "C.UTF-8",
+        "LC_TIME": "pt_BR.UTF-8",
+        "LC_API_KEY": "must-not-pass",
+        "HERMES_API_KEY": "hermes-leak",
+        "GEMINI_API_KEY": "gemini-leak",
+        "GOOGLE_APPLICATION_CREDENTIALS": "/secret/gcp.json",
+        "DATABASE_URL": "postgres://user:password@db/name",
+        "DOCKER_AUTH_CONFIG": "registry-secret",
+        "KUBECONFIG": "/secret/kubeconfig",
+        "GITHUB_PAT": "github-leak",
+        "SSH_AUTH_SOCK": "/run/user/1000/ssh-agent.socket",
         "PYTHONPATH": "/evil/import",
         "LD_PRELOAD": "/evil/lib.so",
         "MISE_EXE": "/usr/bin/mise",
-        "MISE_SHELL": "bash",
-        "MISE_TRUSTED_CONFIG": "1",
+        "__MISE_DIFF": "opaque-parent-environment-diff",
         "ASDF_DIR": "/home/test/.asdf",
         "RANDOM_NOISE": "harmless",
     }
 
-    def test_native_target_uses_allowlist_and_strips_secrets(self):
+    def test_all_targets_receive_same_positive_allowlist(self):
         with patch.dict(os.environ, self.HOSTILE_ENV, clear=True):
-            env = tools._build_env_for_target("/usr/bin/agy", kind="native")
+            native = tools._build_env_for_target("/usr/bin/agy", kind="native")
+            script = tools._build_env_for_target("/tmp/agy", kind="script")
 
-        # Allowlist basics
-        self.assertIn("PATH", env)
-        self.assertIn("HOME", env)
-        self.assertIn("USER", env)
+        self.assertEqual(native, script)
+        self.assertEqual(
+            native,
+            {
+                "PATH": "/usr/bin:/bin",
+                "HOME": "/home/test",
+                "USER": "tester",
+                "LANG": "C.UTF-8",
+                "LC_TIME": "pt_BR.UTF-8",
+            },
+        )
 
-        # No Hermes or third-party secrets
-        for forbidden in (
-            "HERMES_API_KEY",
-            "HERMES_SESSION_TOKEN",
-            "OPENAI_API_KEY",
-            "ANTHROPIC_API_KEY",
-            "AWS_SECRET_ACCESS_KEY",
-            "GITHUB_TOKEN",
-            "PYTHONPATH",
-            "LD_PRELOAD",
-        ):
-            self.assertNotIn(forbidden, env)
-
-    def test_script_target_inherits_mise_and_other_loader_vars(self):
-        """The whole point of the fix: a shim wrapper must see MISE_*
-        and other loader vars so it can locate the real agy binary."""
+    def test_strict_environment_removes_credentials_capabilities_and_manager_state(self):
         with patch.dict(os.environ, self.HOSTILE_ENV, clear=True):
-            env = tools._build_env_for_target(
-                "/home/test/.local/bin/agy", kind="script"
-            )
+            env = tools._build_env_for_agy("/tmp/agy")
 
-        # Loader vars MUST survive
-        self.assertEqual(env.get("MISE_EXE"), "/usr/bin/mise")
-        self.assertEqual(env.get("MISE_SHELL"), "bash")
-        self.assertEqual(env.get("ASDF_DIR"), "/home/test/.asdf")
-
-        # And PATH/HOME/USER too (needed to even find the interpreter)
-        self.assertEqual(env.get("PATH"), "/usr/bin:/bin")
-        self.assertEqual(env.get("HOME"), "/home/test")
-
-        # But secrets MUST still be stripped (denylist works)
-        for forbidden in (
-            "HERMES_API_KEY",
-            "HERMES_SESSION_TOKEN",
-            "OPENAI_API_KEY",
-            "ANTHROPIC_API_KEY",
-            "AWS_SECRET_ACCESS_KEY",
-            "GITHUB_TOKEN",
-        ):
-            self.assertNotIn(forbidden, env)
-
-    def test_script_target_strips_loader_injection_attacks(self):
-        """LD_PRELOAD / LD_LIBRARY_PATH / PYTHONPATH / DYLD_* are
-        classic loader hijack vectors. Denylist must catch them even
-        in script mode."""
-        with patch.dict(os.environ, self.HOSTILE_ENV, clear=True):
-            env = tools._build_env_for_target(
-                "/home/test/.local/bin/agy", kind="script"
-            )
-        for forbidden in ("LD_PRELOAD", "PYTHONPATH"):
-            self.assertNotIn(forbidden, env)
+        forbidden = set(self.HOSTILE_ENV) - {"PATH", "HOME", "USER", "LANG", "LC_TIME"}
+        self.assertTrue(forbidden.isdisjoint(env), forbidden.intersection(env))
+    def test_strict_environment_removes_relative_path_entries(self):
+        hostile = {
+            "PATH": ".:/usr/bin::relative/bin:/bin",
+            "HOME": "/home/test",
+        }
+        with patch.dict(os.environ, hostile, clear=True):
+            env = tools._build_env_allowlist()
+        self.assertEqual(env["PATH"], "/usr/bin:/bin")
 
 
-class DispatchTests(unittest.TestCase):
-    """The public entry point must detect the kind and dispatch to the
-    matching builder. It is the only function _execute_once will call."""
+class WrapperResolutionTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="agy-resolve-")
+        self.addCleanup(self.tmp.cleanup)
+        self.tmpdir = Path(self.tmp.name)
+        tools._AGY_PROBE_CACHE.clear()
 
-    def test_dispatches_to_native_builder_for_native_binary(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            elf = Path(tmp) / "agy"
-            elf.write_bytes(b"\x7fELF\x02\x01\x01" + b"\x00" * 8)
-            elf.chmod(0o755)
-            with patch.dict(os.environ, {"MISE_EXE": "/usr/bin/mise"}, clear=True):
-                env = tools._build_env_for_agy(str(elf))
-            self.assertNotIn("MISE_EXE", env)
+    def _write(self, name: str, content: bytes) -> Path:
+        path = self.tmpdir / name
+        path.write_bytes(content)
+        path.chmod(0o755)
+        return path
 
-    def test_dispatches_to_script_builder_for_shim(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            shim = Path(tmp) / "agy"
-            shim.write_bytes(b"#!/bin/bash\necho shim\n")
-            shim.chmod(0o755)
-            with patch.dict(
-                os.environ,
-                {"MISE_EXE": "/usr/bin/mise", "PATH": "/bin", "HOME": "/tmp"},
-                clear=True,
-            ):
-                env = tools._build_env_for_agy(str(shim))
-            self.assertEqual(env.get("MISE_EXE"), "/usr/bin/mise")
+    def test_mise_wrapper_resolves_real_executable_with_strict_environment(self):
+        wrapper = self._write(
+            "agy-wrapper",
+            b"#!/bin/sh\nexec mise x antigravity-cli -- agy \"$@\"\n",
+        )
+        manager = self._write("mise", b"#!/bin/sh\nexit 0\n")
+        real = self._write("agy-real", b"\x7fELF" + b"\x00" * 16)
+
+        def fake_which(name, path=None):
+            if name == "mise":
+                return str(manager)
+            return None
+
+        completed = subprocess.CompletedProcess(
+            [str(manager), "which", "agy"], 0, stdout=f"{real}\n", stderr=""
+        )
+        hostile = {
+            "PATH": str(self.tmpdir),
+            "HOME": str(self.tmpdir),
+            "GEMINI_API_KEY": "must-not-pass",
+            "SSH_AUTH_SOCK": "/tmp/agent.sock",
+            "__MISE_DIFF": "opaque-secret-container",
+        }
+        with patch.dict(os.environ, hostile, clear=True), patch(
+            "tools.shutil.which", side_effect=fake_which
+        ), patch("tools.subprocess.run", return_value=completed) as run:
+            resolved = tools._resolve_agy_target(str(wrapper))
+
+        self.assertEqual(resolved, str(real.resolve()))
+        args, kwargs = run.call_args
+        self.assertEqual(args[0], [str(manager), "which", "agy"])
+        self.assertEqual(kwargs["env"], {"PATH": str(self.tmpdir), "HOME": str(self.tmpdir)})
+        self.assertIs(kwargs["stdin"], subprocess.DEVNULL)
+        self.assertNotIn("GEMINI_API_KEY", kwargs["env"])
+        self.assertNotIn("SSH_AUTH_SOCK", kwargs["env"])
+        self.assertNotIn("__MISE_DIFF", kwargs["env"])
+
+    def test_known_manager_wrapper_fails_closed_when_resolution_fails(self):
+        wrapper = self._write("agy-wrapper", b"#!/bin/sh\nexec mise x -- agy \"$@\"\n")
+        manager = self._write("mise", b"#!/bin/sh\nexit 1\n")
+        failed = subprocess.CompletedProcess(
+            [str(manager), "which", "agy"], 1, stdout="", stderr="not installed"
+        )
+        with patch.dict(os.environ, {"PATH": str(self.tmpdir), "HOME": str(self.tmpdir)}, clear=True), patch(
+            "tools.shutil.which", return_value=str(manager)
+        ), patch("tools.subprocess.run", return_value=failed):
+            with self.assertRaisesRegex(RuntimeError, "could not resolve"):
+                tools._resolve_agy_target(str(wrapper))
+
+    def test_generic_script_runs_with_strict_environment_without_manager_resolution(self):
+        script = self._write("agy-script", b"#!/usr/bin/env python3\nprint('1.2.0')\n")
+        with patch("tools.subprocess.run") as run:
+            resolved = tools._resolve_agy_target(str(script))
+        self.assertEqual(resolved, str(script.resolve()))
+        run.assert_not_called()
+
+    def test_version_probe_uses_strict_environment_and_devnull(self):
+        native = self._write("agy-native", b"\x7fELF" + b"\x00" * 16)
+        completed = subprocess.CompletedProcess(
+            [str(native), "--version"], 0, stdout="agy 1.2.0", stderr=""
+        )
+        hostile = {
+            "PATH": "/usr/bin",
+            "HOME": str(self.tmpdir),
+            "OPENAI_API_KEY": "must-not-pass",
+            "SSH_AUTH_SOCK": "/tmp/agent.sock",
+        }
+        with patch.dict(os.environ, hostile, clear=True), patch(
+            "tools.subprocess.run", return_value=completed
+        ) as run:
+            valid, resolved, error = tools._check_agy_executable(str(native))
+
+        self.assertTrue(valid, error)
+        self.assertEqual(resolved, str(native.resolve()))
+        kwargs = run.call_args.kwargs
+        self.assertEqual(kwargs["env"], {"PATH": "/usr/bin", "HOME": str(self.tmpdir)})
+        self.assertIs(kwargs["stdin"], subprocess.DEVNULL)
+        self.assertNotIn("OPENAI_API_KEY", kwargs["env"])
+        self.assertNotIn("SSH_AUTH_SOCK", kwargs["env"])
 
 
 if __name__ == "__main__":

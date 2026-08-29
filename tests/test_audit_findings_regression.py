@@ -28,6 +28,7 @@ from tools import (
     OwnedProcess,
     register_tools,
     _check_agy_executable,
+    _build_env_allowlist,
     _truncate_utf8,
     LEASE_LOCKED,
     LEASE_UNLOCKED,
@@ -192,7 +193,8 @@ print(json.dumps({'status': 'SUCCESS', 'response': json.dumps(observed), 'conver
         manager = AgyManager(settings={"max_concurrent": 1}, agy_path=str(fake_script))
         self.managers.append(manager)
 
-        # Sandbox run must pass --mode=plan --sandbox and NOT --dangerously-skip-permissions
+        # Sandbox remains in plan mode; headless runs also bypass interactive
+        # permission prompts so tool use cannot deadlock or return empty output.
         resp = json.loads(
             manager.handle(
                 {
@@ -209,7 +211,7 @@ print(json.dumps({'status': 'SUCCESS', 'response': json.dumps(observed), 'conver
         obs = json.loads(resp["results"][0]["response"])
         self.assertIn("--mode=plan", obs["argv"])
         self.assertIn("--sandbox", obs["argv"])
-        self.assertNotIn("--dangerously-skip-permissions", obs["argv"])
+        self.assertIn("--dangerously-skip-permissions", obs["argv"])
 
         # Attempting accept_edits with allow_accept_edits=False must fail
         resp_blocked = json.loads(
@@ -261,11 +263,10 @@ print(json.dumps({'status': 'SUCCESS', 'response': json.dumps(observed), 'conver
             "fake_env_check",
             """
 import os, sys, json
-secrets_leaked = [k for k in os.environ if "SECRET" in k or "HERMES_" in k or "KEY" in k]
 stdin_is_atty = sys.stdin.isatty()
 print(json.dumps({
     "status": "SUCCESS",
-    "response": json.dumps({"leaked": secrets_leaked, "is_atty": stdin_is_atty}),
+    "response": json.dumps({"env_keys": sorted(os.environ), "is_atty": stdin_is_atty}),
     "conversation_id": "c1"
 }))
 """,
@@ -279,6 +280,7 @@ print(json.dumps({
                 "MY_SUPER_SECRET": "top-secret",
             },
         ):
+            expected_env_keys = set(_build_env_allowlist())
             resp = json.loads(
                 manager.handle(
                     {
@@ -292,32 +294,20 @@ print(json.dumps({
             )
             self.assertTrue(resp["success"], resp)
             obs = json.loads(resp["results"][0]["response"])
-            # Hermes secrets and credential-like values must NEVER reach
-            # the worker, regardless of whether the agy binary is a
-            # native executable (allowlist) or a shim script (denylist).
-            # The denylist intentionally tolerates unrelated env vars
-            # whose name happens to contain "KEY" (e.g. terminal
-            # cosmetics like GUM_LOG_KEY_FOREGROUND) because shim
-            # wrappers like mise/asdf/rtx need their full tool-chain
-            # context to resolve the real agy binary.
-            leaked_secrets = [
-                k for k in obs["leaked"]
-                if any(
-                    pat in k
-                    for pat in (
-                        "HERMES_", "OPENAI_", "ANTHROPIC_", "CLAUDE_",
-                        "AWS_", "GITHUB_TOKEN", "SECRET", "PASSWORD",
-                        "LD_PRELOAD", "LD_LIBRARY_PATH", "DYLD_",
-                        "PYTHONPATH", "PYTHONHOME",
-                    )
-                )
-            ]
-            self.assertEqual(leaked_secrets, [], f"Leaked secret-like vars: {leaked_secrets}")
-            # And confirm the test scenario's hostile secrets specifically
-            # did not reach the worker.
-            self.assertNotIn("HERMES_AUTH_TOKEN", obs["leaked"])
-            self.assertNotIn("OPENAI_API_KEY", obs["leaked"])
-            self.assertNotIn("MY_SUPER_SECRET", obs["leaked"])
+            self.assertEqual(set(obs["env_keys"]), expected_env_keys)
+            for forbidden in (
+                "HERMES_AUTH_TOKEN",
+                "OPENAI_API_KEY",
+                "MY_SUPER_SECRET",
+                "GEMINI_API_KEY",
+                "DATABASE_URL",
+                "DOCKER_AUTH_CONFIG",
+                "GOOGLE_APPLICATION_CREDENTIALS",
+                "KUBECONFIG",
+                "SSH_AUTH_SOCK",
+                "__MISE_DIFF",
+            ):
+                self.assertNotIn(forbidden, obs["env_keys"])
             self.assertFalse(obs["is_atty"])
 
     # --- H-07: Output bounded in memory and records ---

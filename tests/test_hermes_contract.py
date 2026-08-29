@@ -38,7 +38,7 @@ manager.discover_and_load()
 loaded = manager._plugins["delegate-agy"]
 assert loaded.enabled, loaded.error
 assert loaded.manifest.kind == "standalone"
-assert loaded.manifest.version == "0.2.0"
+assert loaded.manifest.version == "0.2.1"
 assert loaded.manifest.license == "MIT"
 assert loaded.manifest.homepage == "https://github.com/matheusdmlopes/hermes-delegate-agy"
 
