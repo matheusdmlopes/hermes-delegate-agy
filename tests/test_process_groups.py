@@ -301,7 +301,7 @@ class ProcessGroupTests(unittest.TestCase):
 
         thread.join(timeout=5)
 
-        self.assertFalse(thread.is_alive(), "outer timeout left communicate() unbounded")
+        self.assertFalse(thread.is_alive(), "outer timeout left streaming drain unbounded")
         self.assertEqual(outcome, [False])
         self.assertEqual(record.status, "timed_out")
         self.assertTrue(wait_until(lambda: not pid_exists(child_pid)))
@@ -377,7 +377,7 @@ class ProcessGroupTests(unittest.TestCase):
         self.assertTrue(wait_until(lambda: not group_exists(pgid)))
         self.assertEqual(manager._processes, {})
 
-    def test_communicate_oserror_cleans_up_process_group(self):
+    def test_stream_drain_oserror_cleans_up_process_group(self):
         script = self._script("comm-error", "import time\nwhile True: time.sleep(1)\n")
         manager = self._manager(script)
         tools_module = sys.modules[self.AgyManager.__module__]
@@ -397,12 +397,16 @@ class ProcessGroupTests(unittest.TestCase):
         )
         manager._records[record.worker_id] = record
 
-        with patch.object(subprocess.Popen, "communicate", side_effect=OSError("injected communicate I/O error")):
+        with patch.object(
+            manager,
+            "_drain_and_stream",
+            side_effect=OSError("injected stream drain I/O error"),
+        ):
             success = manager._execute_once(record, record.prompt)
 
         self.assertFalse(success)
         self.assertEqual(record.status, "failed")
-        self.assertIn("communicate", record.error)
+        self.assertIn("stream drain", record.error)
         if record.pgid:
             self.test_groups.add(record.pgid)
             self.assertTrue(wait_until(lambda: not pid_exists(record.pid)))

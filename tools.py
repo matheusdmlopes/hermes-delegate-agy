@@ -1541,6 +1541,7 @@ class AgyManager:
         stdout_dest: Path,
         stderr_dest: Path,
         timeout: float,
+        pgid: int | None,
     ) -> tuple[str, str, str | None]:
         """Stream process output directly to disk up to max_raw_output_bytes and sample memory."""
         stdout_temp = stdout_dest.with_name(f"{stdout_dest.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
@@ -1611,6 +1612,14 @@ class AgyManager:
             drain_error = f"agy exceeded the timeout of {timeout}s"
         except Exception as exc:
             drain_error = f"Process wait failed: {exc}"
+
+        # A descendant can inherit stdout/stderr and keep the reader threads
+        # blocked after the leader exits or times out. Terminate the owned
+        # process group before joining/closing the pipes; closing a buffered
+        # pipe from this thread while another thread is inside read() can
+        # otherwise wait forever on the stream's internal lock.
+        if drain_error is not None:
+            self._terminate_process(process, pgid)
 
         for t in threads:
             t.join(timeout=PIPE_DRAIN_TIMEOUT_SECONDS)
@@ -1714,7 +1723,7 @@ class AgyManager:
 
             timeout = record.timeout_seconds + 30
             stdout, stderr, drain_error = self._drain_and_stream(
-                process, stdout_dest, stderr_dest, timeout
+                process, stdout_dest, stderr_dest, timeout, pgid
             )
 
             if cancel_requested:
